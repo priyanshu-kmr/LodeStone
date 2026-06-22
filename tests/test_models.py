@@ -52,6 +52,33 @@ def test_models_loading_at_the_same_time_all_keep_one_dtype(embedder) -> None:
     assert torch.get_default_dtype() == torch.float32
 
 
+def test_searching_while_the_indexing_model_loads_still_works() -> None:
+    """Loading changes PyTorch's default dtype, so searches have to wait it out safely."""
+    from lodestone.embedder import GemmaEmbedder
+
+    fresh = GemmaEmbedder()
+    fresh.warm_up()
+    errors: list[Exception] = []
+    done = threading.Event()
+
+    def keep_searching() -> None:
+        try:
+            while not done.is_set():
+                assert np.isfinite(fresh.encode_query("search during a model load")).all()
+        except Exception as error:
+            errors.append(error)
+
+    searcher = threading.Thread(target=keep_searching)
+    searcher.start()
+    try:
+        vectors = fresh.encode_images([_photo(3)])
+    finally:
+        done.set()
+        searcher.join()
+    assert errors == []
+    assert np.isfinite(vectors).all()
+
+
 def test_vectors_are_unit_length_and_finite(embedder) -> None:
     vectors = [
         embedder.encode_query("my interview notes"),

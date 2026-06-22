@@ -95,4 +95,4 @@ def library(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def fast_settings() -> Settings:
-    return Settings(debounce_seconds=0.0, delete_delay_seconds=0.0)
+    return Settings(debounce_seconds=0.0, delete_delay_seconds=0.0, reindex_cooldown_seconds=0.0)

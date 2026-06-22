@@ -273,6 +273,68 @@ class TestLargeFiles:
             worker.close()
 
 
+class TestBusyFiles:
+    def _engine(self, paths, library, cooldown: float) -> Engine:
+        from lodestone.config import Settings
+
+        settings = Settings(debounce_seconds=0, delete_delay_seconds=0, reindex_cooldown_seconds=cooldown)
+        engine = Engine(paths, FakeEmbedder(), FakeOcr(), settings, watch=False)
+        engine.catalog.add_folder(str(library))
+        return engine
+
+    def test_file_that_keeps_changing_is_not_re_embedded_during_the_cooldown(self, paths, library) -> None:
+        engine = self._engine(paths, library, cooldown=600)
+        path = library / "app_debug.log"
+        path.write_text("first line of the log file")
+        sync(engine)
+        calls = engine.embedder.document_calls
+
+        for i in range(3):
+            path.write_text(f"first line of the log file\nanother line {i}")
+            os.utime(path, (time.time() + 5 + i, time.time() + 5 + i))
+            sync(engine)
+        assert engine.embedder.document_calls == calls
+        # It's still waiting, but that doesn't count as indexing.
+        assert engine.catalog.queue_size() == 1
+        assert engine.status().state == "Up to date"
+        assert engine.status().queued == 0
+        engine.stop()
+
+    def test_changes_are_picked_up_after_the_cooldown(self, paths, library) -> None:
+        engine = self._engine(paths, library, cooldown=0.5)
+        path = library / "app_debug.log"
+        path.write_text("the original log contents")
+        sync(engine)
+        path.write_text("completely replaced log contents")
+        os.utime(path, (time.time() + 5, time.time() + 5))
+        sync(engine)
+        assert "completely" not in engine.catalog.chunks_for_file(engine.catalog.get_file(str(path)).id)[-1][2]
+        time.sleep(0.6)
+        drain(engine)
+        assert "completely" in engine.catalog.chunks_for_file(engine.catalog.get_file(str(path)).id)[-1][2]
+        engine.stop()
+
+    def test_waiting_files_do_not_stop_the_idle_cleanup(self, paths, library) -> None:
+        from lodestone.config import Settings
+
+        settings = Settings(
+            debounce_seconds=0, delete_delay_seconds=0, reindex_cooldown_seconds=600,
+            vision_idle_unload_seconds=0.2,
+        )
+        engine = Engine(paths, FakeEmbedder(), FakeOcr(), settings, watch=False)
+        engine.catalog.add_folder(str(library))
+        path = library / "app_debug.log"
+        path.write_text("first line of the log file")
+        sync(engine)
+        time.sleep(0.3)
+        path.write_text("first line of the log file, then more")
+        os.utime(path, (time.time() + 5, time.time() + 5))
+        sync(engine)  # Only hits the cooldown, so this isn't real work.
+        engine.indexer.idle()
+        assert engine.embedder.released == 1
+        engine.stop()
+
+
 class TestUpdates:
     def test_unchanged_files_are_not_reprocessed(self, engine, library) -> None:
         (library / "a.txt").write_text("hello world")

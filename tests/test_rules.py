@@ -242,6 +242,39 @@ class TestQueryParsing:
         assert standout_scores({}, 0.02) == {}
 
 
+class TestLoadGate:
+    def test_loading_waits_for_work_and_work_waits_for_loading(self) -> None:
+        import threading
+        import time
+
+        from lodestone.embedder import _LoadGate
+
+        gate = _LoadGate()
+        events: list[str] = []
+
+        def load() -> None:
+            with gate.loading():
+                events.append("load start")
+                time.sleep(0.1)
+                events.append("load end")
+
+        def work() -> None:
+            with gate.working():
+                events.append("second work")
+
+        with gate.working():
+            loader = threading.Thread(target=load)
+            loader.start()
+            time.sleep(0.05)
+            events.append("first work ends")
+        time.sleep(0.03)  # The load is now in progress.
+        worker = threading.Thread(target=work)
+        worker.start()
+        loader.join()
+        worker.join()
+        assert events == ["first work ends", "load start", "load end", "second work"]
+
+
 class TestOcrCleanup:
     def test_stray_marks_from_photos_are_dropped(self) -> None:
         assert clean_lines(["O"], [0.89]).text == ""

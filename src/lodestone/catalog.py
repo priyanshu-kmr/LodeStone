@@ -300,6 +300,12 @@ class Catalog:
     def queue_size(self) -> int:
         return self._conn.execute("SELECT COUNT(*) AS n FROM queue").fetchone()["n"]
 
+    def active_queue_size(self) -> int:
+        """Work due soon, so a file waiting out a long cooldown doesn't look like indexing."""
+        return self._conn.execute(
+            "SELECT COUNT(*) AS n FROM queue WHERE not_before <= ?", (time.time() + 30,)
+        ).fetchone()["n"]
+
     def clear_queue_under(self, folder: str) -> None:
         pattern = _like_prefix(folder)
         with self._write_lock, self._conn:
@@ -488,7 +494,8 @@ class Catalog:
             (prefix,),
         ).fetchone()["n"]
         queued = self._conn.execute(
-            "SELECT COUNT(*) AS n FROM queue WHERE path LIKE ? ESCAPE '\\'", (prefix,)
+            "SELECT COUNT(*) AS n FROM queue WHERE path LIKE ? ESCAPE '\\' AND not_before <= ?",
+            (prefix, time.time() + 30),
         ).fetchone()["n"]
         return int(indexed), int(queued)
 

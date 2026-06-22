@@ -345,7 +345,7 @@ class Engine:
 
     def status(self) -> Status:
         counts = self.catalog.counts()
-        queued = self.catalog.queue_size()
+        queued = self.catalog.active_queue_size()
         if self.paused:
             state = "Paused"
         elif self._scanning.is_set():

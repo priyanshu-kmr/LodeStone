@@ -57,6 +57,9 @@ class Settings:
     debounce_seconds: float = 5.0
     delete_delay_seconds: float = 10.0
     rescan_hours: float = 6.0
+    # A file another program keeps writing to, like a log, would otherwise be re-embedded
+    # every few seconds and stop the app from ever going idle.
+    reindex_cooldown_seconds: float = 600.0
     # Large PDFs and text files are fine, because only their opening part gets read. Office files
     # have to be unpacked in full, so they get a much lower limit.
     max_document_bytes: int = 1024 * 1024 * 1024

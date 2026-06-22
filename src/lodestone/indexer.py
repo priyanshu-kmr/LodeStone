@@ -14,9 +14,10 @@ import numpy as np
 from PIL import Image
 
 from . import quality
-from .catalog import Catalog, FileRow
+from .catalog import PRIORITY_SCAN, Catalog, FileRow
 from .config import SETTINGS, Settings, is_under, norm_path
 from .extract import OcrReader, chunk_text, extract, within_embed_limit
+from .office import close_shared_worker
 from .scanner import is_cloud_only, kind_of, path_allowed
 from .vectors import IMAGE, TEXT, VectorStore
 
@@ -89,7 +90,6 @@ class Indexer:
                 self._flush_images(jobs)
                 jobs = []
         self._flush_images(jobs)
-        self._last_work = time.monotonic()
         self._since_maintain += len(paths)
         if self._since_maintain >= 1000:
             self.maintain()
@@ -104,12 +104,12 @@ class Indexer:
         self._since_maintain = 0
 
     def idle(self) -> None:
-        """Called when nothing is ready: tidy the index, then free the GPU."""
+        """Called when nothing is ready: tidy the index, then free the GPU and memory."""
         self.maintain()
-        if (
-            self._model_loaded
-            and time.monotonic() - self._last_work > self._settings.vision_idle_unload_seconds
-        ):
+        if time.monotonic() - self._last_work <= self._settings.vision_idle_unload_seconds:
+            return
+        close_shared_worker()
+        if self._model_loaded:
             self._embedder.release_index_model()
             self._model_loaded = False
 
@@ -206,6 +206,12 @@ class Indexer:
             catalog.dequeue(path)
             return None
 
+        if row and row.status == "indexed" and row.indexed_at and not row.force_full:
+            remaining = row.indexed_at + self._settings.reindex_cooldown_seconds - time.time()
+            if remaining > 0:
+                catalog.enqueue(path, PRIORITY_SCAN, delay=remaining)
+                return None
+
         too_large = self._too_large(kind, info.st_size, path)
         content_hash = None if too_large else hash_file(path)
 
@@ -262,6 +268,7 @@ class Indexer:
 
     def _index_document(self, path: str, file_id: int) -> None:
         settings = self._settings
+        self._last_work = time.monotonic()  # Keeps the Office converter open between documents.
         extracted = extract(path, self._ocr, settings)
         body = chunk_text(extracted.body, settings)
         ocr_chunks = chunk_text(extracted.ocr, settings)
@@ -284,6 +291,7 @@ class Indexer:
         if not pairs:
             return
         self._model_loaded = True
+        self._last_work = time.monotonic()
         vectors = self._embedder.encode_documents([text for _, text in pairs])
         self._vectors.add(TEXT, [chunk_id for chunk_id, _ in pairs], [file_id] * len(pairs), vectors)
         self._dirty = True
@@ -306,6 +314,7 @@ class Indexer:
         if not jobs:
             return
         self._model_loaded = True
+        self._last_work = time.monotonic()
         try:
             vectors = self._embedder.encode_images([j.image for j in jobs])
         except Exception as error:
