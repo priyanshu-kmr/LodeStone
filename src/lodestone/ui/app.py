@@ -179,7 +179,9 @@ class ResultRow(QWidget):
         folder.setObjectName("resultPath")
         snippet = ElidedLabel(result.snippet, Qt.TextElideMode.ElideRight)
         snippet.setObjectName("resultSnippet")
-        snippet.setVisible(bool(result.snippet))
+        # Never call show or setVisible(True) here: without a parent yet, it would open as a window.
+        if not result.snippet:
+            snippet.hide()
 
         column = QVBoxLayout()
         column.setSpacing(1)

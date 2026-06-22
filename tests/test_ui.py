@@ -10,7 +10,8 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox  # noqa: E402
+from PySide6.QtCore import QEvent, QObject  # noqa: E402
+from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox, QWidget  # noqa: E402
 
 from conftest import FakeEmbedder, FakeOcr, textured  # noqa: E402
 from lodestone.config import Settings  # noqa: E402
@@ -77,6 +78,39 @@ def test_typing_shows_results_with_snippets_and_thumbnails(qapp, engine, library
     assert wait_for(qapp, lambda: window.results.count() == 1)
     row = window.results.itemWidget(window.results.item(0))
     assert wait_for(qapp, lambda: row.thumb.pixmap() is not None and not row.thumb.pixmap().isNull())
+    finish(window, qapp)
+
+
+class _WindowSpy(QObject):
+    """Records every top-level window that gets shown, even if only for a moment."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.windows: list[str] = []
+
+    def eventFilter(self, watched, event) -> bool:
+        if event.type() == QEvent.Type.Show and isinstance(watched, QWidget) and watched.isWindow():
+            self.windows.append(type(watched).__name__)
+        return False
+
+
+def test_searching_never_opens_extra_windows(qapp, engine, library) -> None:
+    (library / "notes.txt").write_text("We discussed system design and ownership at length.")
+    textured((640, 480), (220, 20, 20)).save(library / "red_photo.png")
+    drain(engine)
+
+    window = SearchWindow(engine)
+    window.show()
+    wait_for(qapp, lambda: window.isVisible())
+    spy = _WindowSpy()
+    qapp.installEventFilter(spy)
+    try:
+        window.search_box.setText("system design")
+        assert wait_for(qapp, lambda: window.results.count() > 0)
+        wait_for(qapp, lambda: False, timeout=0.3)
+    finally:
+        qapp.removeEventFilter(spy)
+    assert spy.windows == []
     finish(window, qapp)
 
 
