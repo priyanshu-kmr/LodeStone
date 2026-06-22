@@ -22,13 +22,9 @@ uv pip install --python .venv\Scripts\python.exe -e ".[dev]"
 
 ## How it works
 
-```
-Indexing: file watcher + rescans -> SQLite queue -> extract text / OCR -> EmbeddingGemma 2 -> LanceDB + SQLite
-Search:   query -> embed -> text + image vectors -> meaning ranking --\
-                 -> SQLite FTS5 keyword search ------------------------> RRF -> top results
-```
+![LodeStone architecture](docs/architecture.png)
 
-| Part | Choice |
+| Part | Method |
 |---|---|
 | Embeddings | EmbeddingGemma 2 (text and images in one vector space) |
 | OCR | RapidOCR with PP-OCRv6, on the CPU |
