@@ -1,19 +1,26 @@
-"""Checks against the real model and OCR. Slow and needs downloads, so run with: pytest -m models"""
+"""Checks against the real model and OCR. Slow and needs downloads, so run with:
+pytest -m models --override-ini=addopts=
+"""
 
 from __future__ import annotations
 
+import subprocess
+import sys
 import threading
+import time
 
 import numpy as np
 import pytest
 from PIL import Image, ImageDraw, ImageFont
+
+from lodestone.config import Settings
 
 pytestmark = pytest.mark.models
 
 
 def _photo(seed: int) -> Image.Image:
     rng = np.random.default_rng(seed)
-    return Image.fromarray(rng.integers(0, 255, (96, 128, 3), dtype=np.uint8)).resize((800, 600))
+    return Image.fromarray(rng.integers(0, 255, (96, 128, 3), dtype=np.uint8)).resize((400, 300))
 
 
 @pytest.fixture(scope="module")
@@ -23,8 +30,27 @@ def embedder():
     return GemmaEmbedder()
 
 
+def test_cpu_mode_never_touches_the_gpu() -> None:
+    """In a fresh process, because other tests in this file may start the GPU."""
+    code = (
+        "import torch\n"
+        "from PIL import Image\n"
+        "from lodestone.embedder import GemmaEmbedder\n"
+        "e = GemmaEmbedder()\n"
+        "e.encode_query('hello')\n"
+        "e.encode_documents(['some document text for the test'])\n"
+        "e.encode_images([Image.new('RGB', (300, 300), (200, 100, 50))])\n"
+        "assert not torch.cuda.is_initialized(), 'CUDA was started'\n"
+        "assert {str(p.device) for p in e._query_model.parameters()} == {'cpu'}\n"
+        "assert {str(p.device) for p in e._index_model.parameters()} == {'cpu'}\n"
+        "assert torch.get_num_threads() == 4\n"
+    )
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=300)
+    assert result.returncode == 0, result.stderr[-1500:]
+
+
 def test_models_loading_at_the_same_time_all_keep_one_dtype(embedder) -> None:
-    """The app's startup loads both models in parallel, which once broke every image."""
+    """The app's startup can load both models in parallel, which once broke every image."""
     import torch
 
     errors: list[Exception] = []
@@ -45,10 +71,9 @@ def test_models_loading_at_the_same_time_all_keep_one_dtype(embedder) -> None:
         thread.join()
     assert errors == []
 
-    expected = torch.bfloat16 if torch.cuda.is_available() else torch.float32
-    for model in (embedder._query_model, embedder._index_model):
-        kinds = {p.dtype for p in model.parameters() if p.is_floating_point()}
-        assert kinds == {expected}
+    # On the CPU, search uses bfloat16 to save RAM, and indexing uses float32 for speed.
+    assert {p.dtype for p in embedder._query_model.parameters() if p.is_floating_point()} == {torch.bfloat16}
+    assert {p.dtype for p in embedder._index_model.parameters() if p.is_floating_point()} == {torch.float32}
     assert torch.get_default_dtype() == torch.float32
 
 
@@ -79,6 +104,21 @@ def test_searching_while_the_indexing_model_loads_still_works() -> None:
     assert np.isfinite(vectors).all()
 
 
+def test_search_model_unloads_when_idle_and_comes_back() -> None:
+    from lodestone.embedder import GemmaEmbedder
+
+    fresh = GemmaEmbedder(Settings(search_idle_unload_seconds=0.2))
+    before = fresh.encode_query("the same search twice")
+    fresh.release_search_model_if_idle()
+    assert fresh.search_model_loaded  # Too soon.
+    time.sleep(0.3)
+    fresh.release_search_model_if_idle()
+    assert not fresh.search_model_loaded
+    after = fresh.encode_query("the same search twice")
+    assert fresh.search_model_loaded
+    assert float(np.dot(before, after)) > 0.999
+
+
 def test_vectors_are_unit_length_and_finite(embedder) -> None:
     vectors = [
         embedder.encode_query("my interview notes"),
@@ -92,12 +132,36 @@ def test_vectors_are_unit_length_and_finite(embedder) -> None:
 
 
 def test_search_and_index_models_produce_the_same_text_vectors(embedder) -> None:
+    """They use different dtypes on the CPU, which must not change what the vectors mean."""
     text = "the same sentence through both models"
-    embedder.encode_images([_photo(2)])  # Make sure the indexing model is loaded.
+    embedder.warm_up()
     query_model = embedder._query_model.encode(text, prompt_name="Document")
     index_model = embedder.encode_documents([text])[0]
     similarity = float(np.dot(query_model / np.linalg.norm(query_model), index_model))
     assert similarity > 0.999
+
+
+def test_gpu_and_cpu_vectors_match_when_a_gpu_is_available() -> None:
+    import torch
+
+    from lodestone.embedder import GemmaEmbedder
+
+    if not torch.cuda.is_available():
+        pytest.skip("no GPU")
+    fresh = GemmaEmbedder()
+    text = "a query compared across devices"
+    on_cpu = fresh.encode_query(text)
+    image_cpu = fresh.encode_images([_photo(4)])[0]
+    fresh.set_use_gpu(True)
+    assert not fresh.search_model_loaded
+    on_gpu = fresh.encode_query(text)
+    image_gpu = fresh.encode_images([_photo(4)])[0]
+    assert {str(p.device) for p in fresh._query_model.parameters()} == {"cuda:0"}
+    assert {p.dtype for p in fresh._query_model.parameters() if p.is_floating_point()} == {torch.bfloat16}
+    assert float(np.dot(on_cpu, on_gpu)) > 0.999
+    assert float(np.dot(image_cpu, image_gpu)) > 0.99
+    fresh.set_use_gpu(False)
+    assert fresh._query_model is None and fresh._index_model is None
 
 
 def test_ocr_reads_printed_text_and_ignores_blank_images() -> None:
@@ -110,3 +174,5 @@ def test_ocr_reads_printed_text_and_ignores_blank_images() -> None:
     assert "48213" in ocr.read(image).text
     assert "48213" in ocr.read_page(image).text
     assert ocr.read(Image.new("RGB", (600, 400), (200, 200, 200))).text == ""
+    ocr.release()
+    assert "48213" in ocr.read(image).text  # Reloads when next needed.

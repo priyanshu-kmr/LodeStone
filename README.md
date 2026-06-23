@@ -9,6 +9,9 @@ Desktop, Documents, Downloads and Pictures. Change folders under **Settings**.
 
 Closing the window keeps it indexing in the system tray. Use **Quit** in the tray menu to stop it.
 
+It runs on the CPU by default. **Settings > Use GPU if available** indexes images about 30x faster
+but uses up to about 4 GB of VRAM. Models unload when idle: indexing after 1 minute, search after 10.
+
 The index is in `%LOCALAPPDATA%\LodeStone` and holds copies of your documents' text.
 
 ## Setup

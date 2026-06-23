@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import threading
 import time
 from pathlib import Path
 
@@ -178,6 +179,46 @@ def test_settings_lists_and_changes_folders(qapp, engine, library, tmp_path, mon
     dialog._remove_folder()
     assert wait_for(qapp, lambda: dialog.folder_tree.topLevelItemCount() == 1)
     dialog.close()
+    finish(window, qapp)
+
+
+def test_gpu_checkbox_starts_off_and_saves_the_choice(qapp, engine) -> None:
+    window = SearchWindow(engine)
+    dialog = SettingsDialog(engine, window)
+    assert dialog.use_gpu.isChecked() is False
+    dialog.use_gpu.setChecked(True)
+    assert wait_for(qapp, lambda: engine.use_gpu)
+    assert engine.embedder.gpu_settings == [True]
+    dialog.close()
+    finish(window, qapp)
+
+
+def test_status_says_when_the_search_model_is_loading(qapp, engine, library) -> None:
+    (library / "a.txt").write_text("some notes about a project")
+    drain(engine)
+    engine.embedder.search_model_loaded = False
+    window = SearchWindow(engine)
+    window.show()
+    release = threading.Event()
+    original = engine.search
+
+    def slow_search(*args, **kwargs):
+        release.wait(5)
+        return original(*args, **kwargs)
+
+    engine.search = slow_search
+    window.search_box.setText("project notes")
+    assert wait_for(qapp, lambda: "Loading the search model" in window.status_text.text())
+    release.set()
+    assert wait_for(qapp, lambda: window.results.count() > 0)
+    assert wait_for(qapp, lambda: "indexed" in window.status_text.text())
+    finish(window, qapp)
+
+
+def test_opening_the_window_prepares_search(qapp, engine) -> None:
+    window = SearchWindow(engine)
+    window.bring_forward()
+    assert wait_for(qapp, lambda: engine.embedder.warm_ups == 1)
     finish(window, qapp)
 
 

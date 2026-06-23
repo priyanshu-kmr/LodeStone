@@ -52,6 +52,10 @@ class Ocr:
             )
         return self._engines[size]
 
+    def release(self) -> None:
+        with self._lock:
+            self._engines.clear()
+
     def _run(self, image: Image.Image, size: str) -> OcrResult:
         bgr = np.asarray(image.convert("RGB"))[:, :, ::-1]
         with self._lock:

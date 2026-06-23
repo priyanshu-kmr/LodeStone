@@ -273,6 +273,35 @@ class TestLargeFiles:
             worker.close()
 
 
+class TestGpuSetting:
+    def test_off_by_default_and_remembered(self, paths, fast_settings) -> None:
+        first = Engine(paths, FakeEmbedder(), FakeOcr(), fast_settings, watch=False)
+        assert first.use_gpu is False
+        first.set_use_gpu(True)
+        assert first.embedder.gpu_settings == [True]
+        first.catalog.close()
+        second = Engine(paths, FakeEmbedder(), FakeOcr(), fast_settings, watch=False)
+        assert second.use_gpu is True
+
+
+class TestIdle:
+    def test_idle_frees_ocr_and_the_indexing_model(self, paths, library) -> None:
+        from lodestone.config import Settings
+
+        settings = Settings(debounce_seconds=0, delete_delay_seconds=0, vision_idle_unload_seconds=0.1)
+        engine = Engine(paths, FakeEmbedder(), FakeOcr(), settings, watch=False)
+        engine.catalog.add_folder(str(library))
+        (library / "a.txt").write_text("some text worth embedding")
+        sync(engine)
+        engine.indexer.idle()
+        assert engine.embedder.released == 0  # Not idle for long enough yet.
+        time.sleep(0.2)
+        engine.indexer.idle()
+        assert engine.embedder.released == 1
+        assert engine.indexer._ocr.released is True
+        engine.stop()
+
+
 class TestBusyFiles:
     def _engine(self, paths, library, cooldown: float) -> Engine:
         from lodestone.config import Settings

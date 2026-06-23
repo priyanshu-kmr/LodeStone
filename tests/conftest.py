@@ -34,6 +34,9 @@ class FakeEmbedder:
         self.image_calls = 0
         self.document_calls = 0
         self.released = 0
+        self.gpu_settings: list[bool] = []
+        self.warm_ups = 0
+        self.search_model_loaded = True
         self.fail_on_size: tuple[int, int] | None = None
 
     def encode_query(self, text: str) -> np.ndarray:
@@ -58,6 +61,15 @@ class FakeEmbedder:
     def release_index_model(self) -> None:
         self.released += 1
 
+    def release_search_model_if_idle(self) -> None:
+        pass
+
+    def set_use_gpu(self, use_gpu: bool) -> None:
+        self.gpu_settings.append(use_gpu)
+
+    def warm_up(self) -> None:
+        self.warm_ups += 1
+
 
 class FakeOcr:
     def __init__(self, text: str = "") -> None:
@@ -69,6 +81,9 @@ class FakeOcr:
         return OcrResult(self.text, 0.9 if self.text else None)
 
     read_page = read
+
+    def release(self) -> None:
+        self.released = True
 
 
 def textured(size: tuple[int, int], colour: tuple[int, int, int], seed: int = 0) -> Image.Image:

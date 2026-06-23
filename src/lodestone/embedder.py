@@ -1,7 +1,8 @@
 """EmbeddingGemma 2, loaded as two instances so search stays light and is never blocked.
 
-Search keeps only the text encoder loaded. Indexing loads text and vision while it has work, then
-frees the GPU. Both produce vectors in the same space, so they can be used interchangeably.
+Search only needs the text encoder. Indexing loads text and vision while it has work. Both produce
+vectors in the same space, and both unload when idle. Everything runs on the CPU unless the user
+turns on the GPU, because search is about as fast either way and the GPU option costs VRAM.
 """
 
 from __future__ import annotations
@@ -11,8 +12,9 @@ import gc
 import logging
 import os
 import threading
+import time
 from contextlib import contextmanager
-from typing import Iterator
+from typing import Generator
 
 import numpy as np
 from PIL import Image
@@ -41,6 +43,18 @@ def _return_unused_ram() -> None:
         pass
 
 
+def _free_memory() -> None:
+    gc.collect()
+    try:
+        import torch
+
+        if torch.cuda.is_initialized():
+            torch.cuda.empty_cache()
+    except ImportError:
+        pass
+    _return_unused_ram()
+
+
 class _LoadGate:
     """Model work can overlap with other model work, but never with a model loading."""
 
@@ -50,7 +64,7 @@ class _LoadGate:
         self._is_loading = False
 
     @contextmanager
-    def working(self) -> Iterator[None]:
+    def working(self) -> Generator[None, None, None]:
         with self._changed:
             while self._is_loading:
                 self._changed.wait()
@@ -63,7 +77,7 @@ class _LoadGate:
                 self._changed.notify_all()
 
     @contextmanager
-    def loading(self) -> Iterator[None]:
+    def loading(self) -> Generator[None, None, None]:
         with self._changed:
             while self._is_loading or self._workers:
                 self._changed.wait()
@@ -77,10 +91,12 @@ class _LoadGate:
 
 
 class GemmaEmbedder:
-    def __init__(self, settings: Settings = SETTINGS) -> None:
+    def __init__(self, settings: Settings = SETTINGS, use_gpu: bool = False) -> None:
         self._settings = settings
+        self._use_gpu = use_gpu
         self._query_model = None
         self._index_model = None
+        self._last_query = 0.0
         self._query_lock = threading.Lock()
         self._index_lock = threading.Lock()
         self._gate = _LoadGate()
@@ -93,14 +109,19 @@ class GemmaEmbedder:
         config = {"audio_config": None}
         if not with_vision:
             config["vision_config"] = None
-        cuda = torch.cuda.is_available()
-        device = "cuda" if cuda else "cpu"
+        cuda = self._use_gpu and torch.cuda.is_available()
+        # Google warns that float16 can silently degrade embeddings, so never use it.
         if cuda:
             torch.cuda.set_per_process_memory_fraction(self._settings.max_vram_fraction)
-        # Google warns that float16 can silently degrade embeddings, so never use it. Loading
-        # straight into bfloat16 used over 1 GB less RAM than loading as float32 and converting.
-        dtype = torch.bfloat16 if cuda and torch.cuda.is_bf16_supported() else torch.float32
-        arguments = dict(device=device, config_kwargs=config, model_kwargs={"dtype": dtype})
+            dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float32
+        else:
+            # Half the cores cost little speed and leave the laptop usable. Without bfloat16
+            # hardware, it was 5x slower for indexing, so only search uses it, to save RAM.
+            torch.set_num_threads(self._settings.cpu_threads)
+            dtype = torch.float32 if with_vision else torch.bfloat16
+        arguments = dict(
+            device="cuda" if cuda else "cpu", config_kwargs=config, model_kwargs={"dtype": dtype}
+        )
         # Loading changes PyTorch's default dtype for the whole process, which once broke every
         # image by giving a model mismatched parts. The gate keeps all other model work out.
         with self._gate.loading():
@@ -113,15 +134,61 @@ class GemmaEmbedder:
         model.max_seq_length = self._settings.max_text_tokens
         return model
 
+    # ---- settings and lifecycle ---------------------------------------------------------------
+
+    @property
+    def search_model_loaded(self) -> bool:
+        return self._query_model is not None
+
+    def set_use_gpu(self, use_gpu: bool) -> None:
+        """Drop the loaded models, so each one reloads on the right device when next needed."""
+        with self._query_lock, self._index_lock:
+            if use_gpu == self._use_gpu:
+                return
+            self._use_gpu = use_gpu
+            self._query_model = None
+            self._index_model = None
+        _free_memory()
+
     def warm_up(self) -> None:
-        """Load the query model ahead of time, so the first search does not pay for it."""
+        """Load the search model ahead of time, so the next search does not pay for it."""
+        if self.search_model_loaded:
+            self._last_query = time.monotonic()
+            return
         self.encode_query("warm up")
         _return_unused_ram()
+
+    def release_search_model_if_idle(self) -> None:
+        if (
+            self._query_model is None
+            or time.monotonic() - self._last_query <= self._settings.search_idle_unload_seconds
+        ):
+            return
+        # If a search is running right now, then the model isn't idle.
+        if not self._query_lock.acquire(blocking=False):
+            return
+        try:
+            self._query_model = None
+        finally:
+            self._query_lock.release()
+        _free_memory()
+        log.info("released the search model")
+
+    def release_index_model(self) -> None:
+        with self._index_lock:
+            if self._index_model is None:
+                return
+            self._index_model = None
+        _free_memory()
+        log.info("released the indexing model")
+
+    # ---- embedding ------------------------------------------------------------------------------
 
     def encode_query(self, text: str) -> np.ndarray:
         with self._query_lock:
             if self._query_model is None:
                 self._query_model = self._load(with_vision=False)
+            self._last_query = time.monotonic()
             with self._gate.working():
                 return _unit(
                     self._query_model.encode(text, prompt_name="SearchQuery", show_progress_bar=False)
@@ -151,15 +218,10 @@ class GemmaEmbedder:
                     if batch_size == 1:
                         raise
                     batch_size //= 2
-            self._return_spare_vram()
+            # PyTorch keeps freed VRAM for itself, so hand it back after unusually big batches.
+            if torch.cuda.is_initialized() and torch.cuda.memory_reserved() > 3 * 1024**3:
+                torch.cuda.empty_cache()
             return _unit(vectors)
-
-    def _return_spare_vram(self) -> None:
-        """PyTorch keeps freed memory for itself, so hand it back after unusually big batches."""
-        import torch
-
-        if torch.cuda.is_available() and torch.cuda.memory_reserved() > 3 * 1024**3:
-            torch.cuda.empty_cache()
 
     def encode_images(self, images: list[Image.Image]) -> np.ndarray:
         with self._index_lock:
@@ -173,19 +235,3 @@ class GemmaEmbedder:
                         show_progress_bar=False,
                     )
                 )
-
-    def release_index_model(self) -> None:
-        with self._index_lock:
-            if self._index_model is None:
-                return
-            self._index_model = None
-        gc.collect()
-        try:
-            import torch
-
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        except ImportError:
-            pass
-        _return_unused_ram()
-        log.info("released the indexing model")

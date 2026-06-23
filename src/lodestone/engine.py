@@ -57,7 +57,7 @@ class Engine:
         if embedder is None:
             from .embedder import GemmaEmbedder
 
-            embedder = GemmaEmbedder(settings)
+            embedder = GemmaEmbedder(settings, use_gpu=self.catalog.get_meta("use_gpu") == "1")
         if ocr is None:
             from .ocr import Ocr
 
@@ -328,6 +328,24 @@ class Engine:
             self.catalog.set_force_full(row.id, True)
             self.catalog.enqueue(path, 0)
             self._wake.set()
+
+    # ---- GPU ----------------------------------------------------------------------------------------
+
+    @property
+    def use_gpu(self) -> bool:
+        return self.catalog.get_meta("use_gpu") == "1"
+
+    def set_use_gpu(self, use_gpu: bool) -> None:
+        """Remembered between runs. Falls back to the CPU if there's no usable GPU."""
+        self.catalog.set_meta("use_gpu", "1" if use_gpu else "0")
+        self.embedder.set_use_gpu(use_gpu)
+
+    @property
+    def search_model_loaded(self) -> bool:
+        return self.embedder.search_model_loaded
+
+    def prepare_search(self) -> None:
+        self.embedder.warm_up()
 
     # ---- status -----------------------------------------------------------------------------------
 

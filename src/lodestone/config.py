@@ -93,6 +93,9 @@ class Settings:
     max_vram_fraction: float = 0.65
     held_image_long_side: int = 1280
     vision_idle_unload_seconds: float = 60.0
+    # The next search after this takes a few seconds, because the model has to load again.
+    search_idle_unload_seconds: float = 600.0
+    cpu_threads: int = 4
 
     # Search.
     index_min_vectors: int = 10_000

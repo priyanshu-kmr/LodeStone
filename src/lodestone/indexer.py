@@ -31,6 +31,7 @@ class IndexEmbedder(Protocol):
     def encode_documents(self, texts: list[str]) -> np.ndarray: ...
     def encode_images(self, images: list[Image.Image]) -> np.ndarray: ...
     def release_index_model(self) -> None: ...
+    def release_search_model_if_idle(self) -> None: ...
 
 
 def hash_file(path: str) -> str:
@@ -104,11 +105,13 @@ class Indexer:
         self._since_maintain = 0
 
     def idle(self) -> None:
-        """Called when nothing is ready: tidy the index, then free the GPU and memory."""
+        """Called when nothing is ready: tidy the index, then free whatever has gone unused."""
         self.maintain()
+        self._embedder.release_search_model_if_idle()
         if time.monotonic() - self._last_work <= self._settings.vision_idle_unload_seconds:
             return
         close_shared_worker()
+        self._ocr.release()
         if self._model_loaded:
             self._embedder.release_index_model()
             self._model_loaded = False

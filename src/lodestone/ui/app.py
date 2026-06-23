@@ -210,6 +210,7 @@ class SearchWindow(QMainWindow):
         self.pool.setMaxThreadCount(4)
         self._request = 0
         self._settings: SettingsDialog | None = None
+        self._waiting_for_model = False
         self.quitting = False
 
         self.setWindowTitle("LodeStone")
@@ -344,6 +345,9 @@ class SearchWindow(QMainWindow):
             return
         self._request += 1
         request, mode = self._request, self._mode()
+        if not self.engine.search_model_loaded:
+            self._waiting_for_model = True
+            self.status_text.setText("Loading the search model, which takes a few seconds...")
         _run(
             self.pool,
             lambda: self.engine.search(query, mode=mode),
@@ -353,6 +357,7 @@ class SearchWindow(QMainWindow):
     def _show_results(self, request: int, query: str, results) -> None:
         if request != self._request:
             return  # A newer search has started, so this answer is out of date.
+        self._waiting_for_model = False
         self.results.clear()
         if isinstance(results, Exception):
             self._show_empty("Search failed", str(results))
@@ -419,7 +424,8 @@ class SearchWindow(QMainWindow):
             parts.append(f"{status.queued:,} to go")
         if status.errors:
             parts.append(f"{status.errors:,} couldn't be read")
-        self.status_text.setText(" · ".join(parts))
+        if not self._waiting_for_model:
+            self.status_text.setText(" · ".join(parts))
         if status.pending_prompts:
             _run(self.pool, self.engine.dataset_prompts, self._apply_prompts)
         else:
@@ -455,7 +461,12 @@ class SearchWindow(QMainWindow):
         self._settings.raise_()
         self._settings.activateWindow()
 
+    def prepare_search(self) -> None:
+        """Load the search model in the background, so the first search doesn't wait for it."""
+        _run(self.pool, self.engine.prepare_search)
+
     def bring_forward(self) -> None:
+        self.prepare_search()  # It unloads after a long idle, so opening the window reloads it.
         self.showNormal()
         self.raise_()
         self.activateWindow()
@@ -490,12 +501,21 @@ class SettingsDialog(QDialog):
         self.pause = QCheckBox("Pause indexing")
         self.pause.setChecked(engine.paused)
         self.pause.toggled.connect(engine.set_paused)
+        self.use_gpu = QCheckBox("Use GPU if available")
+        self.use_gpu.setChecked(engine.use_gpu)
+        self.use_gpu.setToolTip(
+            "Faster indexing, needs 3-4GB vram"
+        )
+        self.use_gpu.toggled.connect(
+            lambda checked: _run(self.pool, lambda: engine.set_use_gpu(checked))
+        )
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         buttons.rejected.connect(self.close)
 
         footer = QHBoxLayout()
         footer.addWidget(self.autostart)
         footer.addWidget(self.pause)
+        footer.addWidget(self.use_gpu)
         footer.addStretch(1)
         footer.addWidget(buttons)
 
@@ -788,11 +808,6 @@ def main() -> int:
     window = SearchWindow(engine)
     _server = _listen_for_other_copies(window, app)
 
-    # Load the search model in the background, so the first search doesn't have to wait for it.
-    warm = getattr(engine.embedder, "warm_up", None)
-    if warm:
-        _run(window.pool, warm)
-
     def quit_app() -> None:
         window.quitting = True
         window.close()
@@ -823,8 +838,10 @@ def main() -> int:
     else:
         app.setQuitOnLastWindowClosed(True)
 
+    # Starting in the background at sign-in shouldn't load a model nobody has asked for yet.
     if "--background" not in sys.argv:
         window.show()
+        window.prepare_search()
 
     code = app.exec()
     window.pool.waitForDone(3000)
