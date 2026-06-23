@@ -44,3 +44,7 @@ uv pip install --python .venv\Scripts\python.exe -e ".[dev]"
 - Images under 200x200 px on both sides, or blank, very blurry or unreadable, are found by filename
   only. **Settings > Name-only images** can override this.
 - `.doc`, `.ppt`, `.xls`, `.rtf` and `.heic` are found by filename only. Code files aren't indexed.
+
+## License
+
+[AGPL-3.0](LICENSE)
