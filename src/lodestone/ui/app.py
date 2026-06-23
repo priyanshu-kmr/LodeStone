@@ -702,7 +702,7 @@ class SettingsDialog(QDialog):
     def _review_tab(self) -> QWidget:
         explain = QLabel(
             "These images can only be found by filename, because they failed a quality check. "
-            "If one was flagged by mistake, select it and choose Index anyway."
+            "If one was flagged by mistake, select it and choose Index."
         )
         explain.setWordWrap(True)
         self.review_tree = QTreeWidget()
