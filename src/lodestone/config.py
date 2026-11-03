@@ -19,6 +19,13 @@ NAME_ONLY_EXTS = {".doc", ".ppt", ".xls", ".rtf"}
 IMAGE_EXTS = {
     ".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tif", ".tiff", ".heic",
 }
+AUDIO_EXTS = {
+    ".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg", ".opus", ".wma", ".aiff", ".aif",
+}
+# Not .ts or .mts, because those are usually TypeScript.
+VIDEO_EXTS = {
+    ".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v", ".wmv", ".mpg", ".mpeg",
+}
 
 SKIP_DIRS = {
     "node_modules", ".git", ".hg", ".svn", ".venv", "venv", "__pycache__", "site-packages",
@@ -31,6 +38,10 @@ TEMP_SUFFIXES = (".tmp", ".temp", ".crdownload", ".part", ".partial", ".download
 # The range offered in Settings for embed_token_limit.
 TOKEN_LIMIT_MAX = 5000
 TOKEN_LIMIT_STEP = 100
+
+# The range offered in Settings for how much of each audio and video file gets read.
+MEDIA_SECONDS_MAX = 300
+MEDIA_SECONDS_STEP = 15
 
 # Personal project datasets, relative to the home folder. Seeded once on first run and
 # editable in Settings afterwards.
@@ -73,6 +84,9 @@ class Settings:
     sheet_max_chars: int = 400_000
     max_text_bytes: int = 5 * 1024 * 1024
     max_image_bytes: int = 100 * 1024 * 1024
+    # Media files only get read in part, but they are still hashed in full to notice moves.
+    max_audio_bytes: int = 2 * 1024 * 1024 * 1024
+    max_video_bytes: int = 16 * 1024 * 1024 * 1024
     max_pdf_ocr_pages: int = 50
     pdf_min_page_chars: int = 40
     pdf_ocr_dpi: int = 130
@@ -91,6 +105,20 @@ class Settings:
     image_tokens: int = 280
     image_batch_size: int = 4
     text_batch_size: int = 16
+    # Each media file gets one embedding, made from its opening. At 0, it is found by filename.
+    # Balanced for a Ryzen 5600 with 16 GB of RAM, or an RTX 3060 with the GPU option on.
+    # Measured at 4 CPU threads: about 2 seconds per frame and 0.1 seconds per second of audio.
+    video_seconds: int = 60
+    audio_seconds: int = 60
+    # Past this, a longer duration spreads the same frames further apart, so the cost per video is
+    # capped wherever the slider is. The model's own limit is about 57.
+    video_max_frames: int = 16
+    video_frame_tokens: int = 140  # The model's default. 280 is what images use.
+    video_frames_per_second: float = 1.0
+    video_long_side: int = 1024  # Plenty for 140 tokens, and it saves RAM while decoding.
+    # Too short to mean anything, and silence gets a generic vector like very short text does.
+    audio_min_seconds: float = 0.5
+    audio_silence_rms: float = 0.001
     # Long unbroken text like hex dumps becomes huge token counts, which is slow and fills the GPU.
     max_text_tokens: int = 512
     # Stay within this share of VRAM, and leave the rest for everything else on the laptop.

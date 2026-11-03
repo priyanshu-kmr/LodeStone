@@ -1,6 +1,6 @@
 # LodeStone
 
-Local semantic search for files and images on Windows.
+Local semantic search for files, images, audio and video on Windows.
 
 ## Run
 
@@ -28,8 +28,9 @@ uv pip install --python .venv\Scripts\python.exe -e ".[dev]"
 
 | Part | Method |
 |---|---|
-| Embeddings | EmbeddingGemma 2 (text and images in one vector space) |
+| Embeddings | EmbeddingGemma 2 (text, images, audio and video in one vector space) |
 | OCR | RapidOCR with PP-OCRv6, on the CPU |
+| Audio and video decoding | PyAV |
 | Vectors | LanceDB, exact search under 10,000 vectors, then `IVF_HNSW_SQ` |
 | Files, text, keywords | SQLite with FTS5 |
 | File changes | `watchdog`, plus a rescan at startup and every 6 hours |
@@ -43,6 +44,13 @@ uv pip install --python .venv\Scripts\python.exe -e ".[dev]"
 - OCR on a scanned PDF stops at the same limit, so later scanned pages aren't searchable.
 - Images under 200x200 px on both sides, or blank, very blurry or unreadable, are found by filename
   only. **Settings > Name-only images** can override this.
+- Only the first minute of each audio and video file is read, so later parts aren't searchable.
+  **Settings > Index > Video and audio duration** changes this from 0s to 5 minutes, and reindexes
+  those files. Each file gets one embedding, and a video uses at most 16 frames however long the
+  duration is, so a longer duration spreads them further apart.
+- Audio search matches the overall meaning of a clip, so it can't reliably find an exact spoken phrase.
+- Silent audio, and audio under half a second, is found by filename only. So is any audio over 2 GB
+  and any video over 16 GB.
 - `.doc`, `.ppt`, `.xls`, `.rtf` and `.heic` are found by filename only.
 - Code files aren't indexed unless you add their type under **Settings > Index > Extra file types**.
   Added types need to be plain text, or images that OCR can read. Anything else is found by filename.

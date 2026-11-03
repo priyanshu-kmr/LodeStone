@@ -41,10 +41,17 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..config import SETTINGS, TOKEN_LIMIT_MAX, TOKEN_LIMIT_STEP, data_dir
+from ..config import (
+    MEDIA_SECONDS_MAX,
+    MEDIA_SECONDS_STEP,
+    SETTINGS,
+    TOKEN_LIMIT_MAX,
+    TOKEN_LIMIT_STEP,
+    data_dir,
+)
 from ..engine import Engine
 from ..scanner import parse_exts
-from ..search import ALL, DOCUMENTS, IMAGES, SearchResult
+from ..search import ALL, AUDIO, DOCUMENTS, IMAGES, VIDEOS, SearchResult
 
 log = logging.getLogger(__name__)
 
@@ -150,6 +157,13 @@ def load_thumbnail(path: str, size: int = THUMB):
     return None if image.isNull() else image
 
 
+def _duration_text(seconds: int) -> str:
+    minutes, rest = divmod(seconds, 60)
+    if not minutes:
+        return f"{rest}s"
+    return f"{minutes}m {rest}s" if rest else f"{minutes}m"
+
+
 class ElidedLabel(QLabel):
     """One line of text that shortens with an ellipsis instead of being cut off at the edge."""
 
@@ -238,7 +252,9 @@ class SearchWindow(QMainWindow):
         self.filters.setExclusive(True)
         filter_row = QHBoxLayout()
         filter_row.setSpacing(6)
-        for label, mode in (("All", ALL), ("Documents", DOCUMENTS), ("Images", IMAGES)):
+        for label, mode in (
+            ("All", ALL), ("Documents", DOCUMENTS), ("Images", IMAGES), ("Videos", VIDEOS), ("Audio", AUDIO),
+        ):
             button = QPushButton(label)
             button.setObjectName("filter")
             button.setCheckable(True)
@@ -603,6 +619,9 @@ class SettingsDialog(QDialog):
         self.type_list.addItems(self.engine.custom_exts())
         self.token_slider.setValue(self.engine.token_limit // TOKEN_LIMIT_STEP)
         self._token_moved()
+        self.video_slider.setValue(self.engine.video_seconds // MEDIA_SECONDS_STEP)
+        self.audio_slider.setValue(self.engine.audio_seconds // MEDIA_SECONDS_STEP)
+        self._media_moved()
         self.refresh_counts()
         self.refresh_review()
 
@@ -676,8 +695,8 @@ class SettingsDialog(QDialog):
             answer = QMessageBox.question(
                 self,
                 "Index this large folder?",
-                f"{path} has {estimate.images:,} images and {estimate.documents:,} documents, "
-                "which could take many hours.\n\nIndex it anyway?",
+                f"{path} has {estimate.images:,} images, {estimate.documents:,} documents and "
+                f"{estimate.media:,} audio and video files, which could take many hours.\n\nIndex it anyway?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
                 QMessageBox.StandardButton.Cancel,
             )
@@ -759,13 +778,14 @@ class SettingsDialog(QDialog):
         layout = QVBoxLayout(tab)
         layout.addWidget(self._types_group(), 1)
         layout.addWidget(self._token_group())
+        layout.addWidget(self._media_group())
         layout.addWidget(self._manage_group())
         return tab
 
     def _types_group(self) -> QGroupBox:
         explain = QLabel(
             "Search inside more file types. They need to be plain text, like .xml or .py, or images "
-            "that OCR can read, like .jfif. Anything else, like .zip or .mp4, can only be found by "
+            "that OCR can read, like .jfif. Anything else, like .zip or .exe, can only be found by "
             "its filename."
         )
         explain.setWordWrap(True)
@@ -818,6 +838,47 @@ class SettingsDialog(QDialog):
         group = QGroupBox("Token limit")
         layout = QVBoxLayout(group)
         layout.addLayout(row)
+        layout.addWidget(hint)
+        return group
+
+    def _media_row(self, name: str, apply: Callable[[], None]) -> tuple[QSlider, QLabel, QPushButton, QHBoxLayout]:
+        slider = QSlider(Qt.Orientation.Horizontal)
+        slider.setRange(0, MEDIA_SECONDS_MAX // MEDIA_SECONDS_STEP)
+        slider.setPageStep(4)
+        slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+        slider.setTickInterval(4)
+        slider.setAccessibleName(f"{name} duration")
+        slider.valueChanged.connect(self._media_moved)
+        value = QLabel()
+        value.setMinimumWidth(60)
+        button = QPushButton("Apply")
+        button.clicked.connect(apply)
+        row = QHBoxLayout()
+        row.addWidget(QLabel(name))
+        row.addWidget(slider, 1)
+        row.addWidget(value)
+        row.addWidget(button)
+        return slider, value, button, row
+
+    def _media_group(self) -> QGroupBox:
+        self.video_slider, self.video_value, self.video_apply, video_row = self._media_row(
+            "Video", self._apply_video_duration
+        )
+        self.audio_slider, self.audio_value, self.audio_apply, audio_row = self._media_row(
+            "Audio", self._apply_audio_duration
+        )
+        hint = QLabel(
+            "How much of each file to read for semantic search, from the start. Longer durations find "
+            "more but slow indexing. The audio duration also applies to the sound in videos. At 0s, "
+            "that part isn't searched."
+        )
+        hint.setWordWrap(True)
+        hint.setObjectName("statusText")
+
+        group = QGroupBox("Video and audio duration")
+        layout = QVBoxLayout(group)
+        layout.addLayout(video_row)
+        layout.addLayout(audio_row)
         layout.addWidget(hint)
         return group
 
@@ -879,6 +940,45 @@ class SettingsDialog(QDialog):
             return
         self._index_job(lambda: self.engine.set_token_limit(limit), f"Reindexing with {limit:,} tokens.")
 
+    def _media_moved(self) -> None:
+        video = self.video_slider.value() * MEDIA_SECONDS_STEP
+        audio = self.audio_slider.value() * MEDIA_SECONDS_STEP
+        self.video_value.setText(_duration_text(video))
+        self.audio_value.setText(_duration_text(audio))
+        self.video_apply.setEnabled(video != self.engine.video_seconds)
+        self.audio_apply.setEnabled(audio != self.engine.audio_seconds)
+
+    def _confirm_media_reindex(self, what: str, seconds: int) -> bool:
+        answer = QMessageBox.question(
+            self,
+            "Reindex with the new duration?",
+            f"LodeStone will read and embed your {what} again using the first {_duration_text(seconds)}, "
+            f"which could take a while. Search keeps working in the meantime.{self._paused_note()}",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        return answer == QMessageBox.StandardButton.Yes
+
+    def _apply_video_duration(self) -> None:
+        seconds = self.video_slider.value() * MEDIA_SECONDS_STEP
+        if self._confirm_media_reindex("videos", seconds):
+            self._index_job(
+                lambda: self.engine.set_video_seconds(seconds),
+                f"Reindexing videos with the first {_duration_text(seconds)}.",
+            )
+        else:
+            self.video_slider.setValue(self.engine.video_seconds // MEDIA_SECONDS_STEP)
+
+    def _apply_audio_duration(self) -> None:
+        seconds = self.audio_slider.value() * MEDIA_SECONDS_STEP
+        if self._confirm_media_reindex("audio and videos", seconds):
+            self._index_job(
+                lambda: self.engine.set_audio_seconds(seconds),
+                f"Reindexing audio with the first {_duration_text(seconds)}.",
+            )
+        else:
+            self.audio_slider.setValue(self.engine.audio_seconds // MEDIA_SECONDS_STEP)
+
     def _reindex(self) -> None:
         answer = QMessageBox.question(
             self,
@@ -909,6 +1009,8 @@ class SettingsDialog(QDialog):
         self.reindex_button.setEnabled(False)
         self.delete_button.setEnabled(False)
         self.token_apply.setEnabled(False)
+        self.video_apply.setEnabled(False)
+        self.audio_apply.setEnabled(False)
         self.index_note.setText("Working on it...")
         _run(self.pool, work, lambda result: self._index_job_done(result, message))
 

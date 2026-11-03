@@ -16,7 +16,7 @@ from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication, QFileDialog, QLabel, QMessageBox, QWidget  # noqa: E402
 
 from conftest import FakeEmbedder, FakeOcr, textured  # noqa: E402
-from lodestone.config import TOKEN_LIMIT_STEP, Settings  # noqa: E402
+from lodestone.config import MEDIA_SECONDS_STEP, TOKEN_LIMIT_STEP, Settings  # noqa: E402
 from lodestone.engine import Engine  # noqa: E402
 from lodestone.ui.app import STYLE, SearchWindow, SettingsDialog  # noqa: E402
 
@@ -306,6 +306,50 @@ def test_cancelling_the_prompt_puts_the_slider_back(qapp, engine, index_tab, mon
     assert not dialog.token_apply.isEnabled()
     drain(engine)
     assert engine.embedder.document_calls == calls
+
+
+def test_media_sliders_start_at_the_durations_and_go_from_0s_to_5_minutes(index_tab, engine) -> None:
+    dialog = index_tab
+    assert dialog.video_slider.value() * MEDIA_SECONDS_STEP == engine.video_seconds
+    assert dialog.audio_slider.value() * MEDIA_SECONDS_STEP == engine.audio_seconds
+    assert not dialog.video_apply.isEnabled() and not dialog.audio_apply.isEnabled()
+    for slider in (dialog.video_slider, dialog.audio_slider):
+        assert slider.minimum() == 0
+        assert slider.maximum() * MEDIA_SECONDS_STEP == 300
+    dialog.video_slider.setValue(20)
+    assert dialog.video_value.text() == "5m"
+    dialog.video_slider.setValue(6)
+    assert dialog.video_value.text() == "1m 30s"
+    dialog.audio_slider.setValue(3)
+    assert dialog.audio_value.text() == "45s"
+    dialog.audio_slider.setValue(0)
+    assert dialog.audio_value.text() == "0s"
+    assert "token" not in dialog.video_value.text().lower()
+
+
+def test_changing_a_media_duration_prompts_then_applies(qapp, engine, index_tab, monkeypatch) -> None:
+    dialog = index_tab
+    start = engine.video_seconds
+    new = 4 if start != 4 * MEDIA_SECONDS_STEP else 8
+    dialog.video_slider.setValue(new)
+    assert dialog.video_apply.isEnabled()
+    assert engine.video_seconds == start  # Nothing changes until it's confirmed.
+    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.StandardButton.Yes)
+    dialog.video_apply.click()
+    assert wait_for(qapp, lambda: "Reindexing videos" in dialog.index_note.text())
+    assert engine.video_seconds == new * MEDIA_SECONDS_STEP
+    assert not dialog.video_apply.isEnabled()
+
+
+def test_cancelling_a_media_duration_puts_the_slider_back(qapp, engine, index_tab, monkeypatch) -> None:
+    dialog = index_tab
+    start = engine.audio_seconds
+    monkeypatch.setattr(QMessageBox, "question", _cancel)
+    dialog.audio_slider.setValue(1)
+    dialog.audio_apply.click()
+    assert dialog.audio_slider.value() * MEDIA_SECONDS_STEP == start
+    assert engine.audio_seconds == start
+    assert not dialog.audio_apply.isEnabled()
 
 
 def test_reindex_button_asks_first(qapp, engine, index_tab, monkeypatch) -> None:

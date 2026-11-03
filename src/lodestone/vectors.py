@@ -1,4 +1,4 @@
-"""LanceDB vector storage: one text table and one image table per embedding model."""
+"""LanceDB vector storage: one table per kind of content, per embedding model."""
 
 from __future__ import annotations
 
@@ -22,6 +22,9 @@ os.environ.setdefault("LANCE_INCLUDE_VECTOR_CENTROIDS", "false")
 
 TEXT = "text"
 IMAGE = "image"
+AUDIO = "audio"
+VIDEO = "video"
+VECTOR_KINDS = (TEXT, IMAGE, AUDIO, VIDEO)
 
 
 @dataclass(frozen=True)
@@ -57,7 +60,7 @@ class VectorStore:
                 ("vector", pa.list_(pa.float32(), dim)),
             ]
         )
-        self._names = {kind: _table_name(kind, model_id) for kind in (TEXT, IMAGE)}
+        self._names = {kind: _table_name(kind, model_id) for kind in VECTOR_KINDS}
         self._tables = {kind: self._open(name) for kind, name in self._names.items()}
 
     def _open(self, name: str):

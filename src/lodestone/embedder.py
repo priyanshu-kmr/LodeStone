@@ -1,8 +1,9 @@
 """EmbeddingGemma 2, loaded as two instances so search stays light and is never blocked.
 
-Search only needs the text encoder. Indexing loads text and vision while it has work. Both produce
-vectors in the same space, and both unload when idle. Everything runs on the CPU unless the user
-turns on the GPU, because search is about as fast either way and the GPU option costs VRAM.
+Search only needs the text encoder. Indexing loads text and vision while it has work, and adds the
+audio encoder only once it meets a file with sound. All of them produce vectors in the same space,
+and all unload when idle. Everything runs on the CPU unless the user turns on the GPU, because
+search is about as fast either way and the GPU option costs VRAM.
 """
 
 from __future__ import annotations
@@ -20,8 +21,10 @@ import numpy as np
 from PIL import Image
 
 from .config import MODEL_ID, SETTINGS, Settings
+from .media import SAMPLE_RATE
 
 log = logging.getLogger(__name__)
+_MODEL_MAX_TOKENS = 8192  # What one embedding can hold, across everything in it.
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 
 
@@ -96,17 +99,20 @@ class GemmaEmbedder:
         self._use_gpu = use_gpu
         self._query_model = None
         self._index_model = None
+        self._index_has_audio = False
         self._last_query = 0.0
         self._query_lock = threading.Lock()
         self._index_lock = threading.Lock()
         self._gate = _LoadGate()
 
-    def _load(self, with_vision: bool):
+    def _load(self, with_vision: bool, with_audio: bool = False):
         # Imported here so the UI opens instantly, before these heavy libraries load.
         import torch
         from sentence_transformers import SentenceTransformer
 
-        config = {"audio_config": None}
+        config = {}
+        if not with_audio:
+            config["audio_config"] = None
         if not with_vision:
             config["vision_config"] = None
         cuda = self._use_gpu and torch.cuda.is_available()
@@ -148,6 +154,7 @@ class GemmaEmbedder:
             self._use_gpu = use_gpu
             self._query_model = None
             self._index_model = None
+            self._index_has_audio = False
         _free_memory()
 
     def warm_up(self) -> None:
@@ -179,6 +186,7 @@ class GemmaEmbedder:
             if self._index_model is None:
                 return
             self._index_model = None
+            self._index_has_audio = False
         _free_memory()
         log.info("released the indexing model")
 
@@ -194,8 +202,14 @@ class GemmaEmbedder:
                     self._query_model.encode(text, prompt_name="SearchQuery", show_progress_bar=False)
                 )
 
-    def _indexing_model(self):
-        if self._index_model is None:
+    def _indexing_model(self, with_audio: bool = False):
+        if with_audio and not self._index_has_audio:
+            # The audio encoder is the largest part, so most runs shouldn't pay for it.
+            self._index_model = None
+            _free_memory()
+            self._index_model = self._load(with_vision=True, with_audio=True)
+            self._index_has_audio = True
+        elif self._index_model is None:
             self._index_model = self._load(with_vision=True)
         return self._index_model
 
@@ -235,3 +249,62 @@ class GemmaEmbedder:
                         show_progress_bar=False,
                     )
                 )
+
+    def encode_video(self, frames: list[Image.Image]) -> np.ndarray:
+        """One vector for all of the frames, as an array holding one row."""
+        with self._index_lock:
+            model = self._indexing_model()
+            # When memory runs short, every other frame still covers the same stretch of video.
+            return self._encode_media(
+                model,
+                frames,
+                lambda part: (
+                    [{"video": part}],
+                    {
+                        "video": {
+                            "max_soft_tokens": self._settings.video_frame_tokens,
+                            "max_frames": len(part),
+                            "do_sample_frames": False,  # media.py already chose these frames.
+                        }
+                    },
+                ),
+                lambda part: part[::2],
+            )
+
+    def encode_audio(self, samples: np.ndarray) -> np.ndarray:
+        """One vector for a clip of 16 kHz mono samples, as an array holding one row."""
+        with self._index_lock:
+            model = self._indexing_model(with_audio=True)
+            return self._encode_media(
+                model,
+                samples,
+                lambda part: (
+                    [{"audio": {"array": part, "sampling_rate": SAMPLE_RATE}}],
+                    # Otherwise anything past 30 seconds is silently cut off.
+                    {"audio": {"max_length": len(part)}},
+                ),
+                lambda part: part[: len(part) // 2],
+            )
+
+    def _encode_media(self, model, content, prepare, shrink) -> np.ndarray:
+        import torch
+
+        while True:
+            inputs, kwargs = prepare(content)
+            try:
+                with self._gate.working():
+                    vectors = model.encode(
+                        inputs,
+                        # The usual limit is for text, and going over it here is an error.
+                        processing_kwargs={**kwargs, "text": {"max_length": _MODEL_MAX_TOKENS}},
+                        show_progress_bar=False,
+                    )
+                break
+            except torch.cuda.OutOfMemoryError:
+                torch.cuda.empty_cache()
+                if len(content) <= 1:
+                    raise
+                content = shrink(content)
+        if torch.cuda.is_initialized() and torch.cuda.memory_reserved() > 3 * 1024**3:
+            torch.cuda.empty_cache()
+        return _unit(vectors)

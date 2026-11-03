@@ -13,6 +13,7 @@ from typing import Callable, Collection, Iterable
 from PIL import Image
 
 from .config import (
+    AUDIO_EXTS,
     DOCUMENT_EXTS,
     IMAGE_EXTS,
     NAME_ONLY_EXTS,
@@ -20,6 +21,7 @@ from .config import (
     SKIP_DIRS,
     TEMP_PREFIXES,
     TEMP_SUFFIXES,
+    VIDEO_EXTS,
     Settings,
     is_under,
     norm_path,
@@ -55,6 +57,10 @@ def kind_of(path: str, extra_exts: Collection[str] = ()) -> str | None:
         return "document"
     if ext in IMAGE_EXTS:
         return "image"
+    if ext in AUDIO_EXTS:
+        return "audio"
+    if ext in VIDEO_EXTS:
+        return "video"
     if ext in NAME_ONLY_EXTS:
         return "name_only"
     if ext in extra_exts:
@@ -75,7 +81,7 @@ def parse_exts(text: str) -> list[str]:
         ext = "." + part.lower().lstrip("*.")
         if not _VALID_EXT.fullmatch(ext):
             raise ValueError(f'"{part}" doesn\'t look like a file type. Try something like .xml or .py.')
-        if ext in DOCUMENT_EXTS or ext in IMAGE_EXTS or ext in NAME_ONLY_EXTS:
+        if ext in DOCUMENT_EXTS | IMAGE_EXTS | AUDIO_EXTS | VIDEO_EXTS | NAME_ONLY_EXTS:
             raise ValueError(f"LodeStone already handles {ext} files.")
         if ext in TEMP_SUFFIXES:
             raise ValueError(f"{ext} files are temporary, so LodeStone always skips them.")
@@ -291,10 +297,11 @@ class FolderEstimate:
     documents: int
     images: int
     is_drive_root: bool
+    media: int = 0
 
     @property
     def total(self) -> int:
-        return self.documents + self.images
+        return self.documents + self.images + self.media
 
 
 def estimate_folder(
@@ -303,5 +310,6 @@ def estimate_folder(
     """Count files before indexing, so the UI can warn about very large folders."""
     files, _ = walk(path, excludes, extra_exts=extra_exts)
     images = sum(f.kind == "image" for f in files)
+    media = sum(f.kind in ("audio", "video") for f in files)
     resolved = Path(norm_path(path))
-    return FolderEstimate(len(files) - images, images, resolved == Path(resolved.anchor))
+    return FolderEstimate(len(files) - images - media, images, resolved == Path(resolved.anchor), media)

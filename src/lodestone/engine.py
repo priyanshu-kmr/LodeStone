@@ -56,6 +56,10 @@ class Engine:
         saved_limit = self.catalog.get_meta("user_token_limit")
         if saved_limit is not None:
             settings = replace(settings, embed_token_limit=int(saved_limit))
+        for field in ("video_seconds", "audio_seconds"):
+            saved = self.catalog.get_meta(f"user_{field}")
+            if saved is not None:
+                settings = replace(settings, **{field: int(saved)})
         self.settings = settings
         self.vectors = VectorStore(self.paths.vectors, settings=settings)
         if embedder is None:
@@ -354,6 +358,29 @@ class Engine:
             self.settings = replace(self.settings, embed_token_limit=limit)
             self.indexer.set_settings(self.settings)
             self.catalog.mark_for_reindex(text_only=True)
+        self._settings_changed()
+
+    @property
+    def video_seconds(self) -> int:
+        return self.settings.video_seconds
+
+    @property
+    def audio_seconds(self) -> int:
+        return self.settings.audio_seconds
+
+    def set_video_seconds(self, seconds: int) -> None:
+        self._set_media_seconds("video_seconds", seconds, ["video"])
+
+    def set_audio_seconds(self, seconds: int) -> None:
+        """Videos are included, because this also decides how much of their sound gets read."""
+        self._set_media_seconds("audio_seconds", seconds, ["audio", "video"])
+
+    def _set_media_seconds(self, field: str, seconds: int, kinds: list[str]) -> None:
+        with self._worker_held():
+            self.catalog.set_meta(f"user_{field}", str(seconds))
+            self.settings = replace(self.settings, **{field: seconds})
+            self.indexer.set_settings(self.settings)
+            self.catalog.mark_kinds_for_reindex(kinds)
         self._settings_changed()
 
     def reindex(self) -> None:

@@ -627,13 +627,13 @@ class TestCustomFileTypes:
         assert names(engine.search("48213"))[0] == "scan.jfif"
 
     def test_added_binary_type_is_found_by_name_only(self, engine, library) -> None:
-        (library / "holiday_clip.mp4").write_bytes(b"\x00\x00\x00\x18ftypmp42" * 100)
-        engine.add_custom_exts([".mp4"])
+        (library / "holiday_clip.blend").write_bytes(b"\x00\x00\x00\x18BLENDER" * 100)
+        engine.add_custom_exts([".blend"])
         sync(engine)
-        row = engine.catalog.get_file(str(library / "holiday_clip.mp4"))
+        row = engine.catalog.get_file(str(library / "holiday_clip.blend"))
         assert row.index_level == "name_only" and row.skip_reason == "no_text"
         assert engine.vectors.count(TEXT) == 0
-        assert names(engine.search("holiday clip"))[0] == "holiday_clip.mp4"
+        assert names(engine.search("holiday clip"))[0] == "holiday_clip.blend"
 
     def test_estimate_counts_added_types(self, engine, library) -> None:
         (library / "a.py").write_text("print('hi')")

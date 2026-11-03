@@ -9,7 +9,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Iterator
+from typing import Collection, Iterable, Iterator
 
 from .config import is_under, norm_path
 
@@ -451,6 +451,11 @@ class Catalog:
         )
         with self._write_lock, self._conn:
             self._conn.execute("UPDATE files SET status='pending'" + where)
+
+    def mark_kinds_for_reindex(self, kinds: Collection[str]) -> None:
+        marks = ",".join("?" for _ in kinds)
+        with self._write_lock, self._conn:
+            self._conn.execute(f"UPDATE files SET status='pending' WHERE kind IN ({marks})", tuple(kinds))
 
     def clear_index(self) -> None:
         """Forget every file. Folders, excludes and settings stay."""

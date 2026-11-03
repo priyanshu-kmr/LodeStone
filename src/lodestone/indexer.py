@@ -17,9 +17,10 @@ from . import quality
 from .catalog import PRIORITY_SCAN, Catalog, FileRow
 from .config import SETTINGS, Settings, is_under, norm_path
 from .extract import OcrReader, chunk_text, extract, within_embed_limit
+from .media import SAMPLE_RATE, DecodeError, read_audio, read_frames
 from .office import close_shared_worker
 from .scanner import is_cloud_only, kind_of, path_allowed
-from .vectors import IMAGE, TEXT, VectorStore
+from .vectors import AUDIO, IMAGE, TEXT, VIDEO, VectorStore
 
 log = logging.getLogger(__name__)
 
@@ -30,6 +31,8 @@ OFFICE_EXTS = {".docx", ".pptx", ".xlsx", ".html", ".htm"}
 class IndexEmbedder(Protocol):
     def encode_documents(self, texts: list[str]) -> np.ndarray: ...
     def encode_images(self, images: list[Image.Image]) -> np.ndarray: ...
+    def encode_video(self, frames: list[Image.Image]) -> np.ndarray: ...
+    def encode_audio(self, samples: np.ndarray) -> np.ndarray: ...
     def release_index_model(self) -> None: ...
     def release_search_model_if_idle(self) -> None: ...
 
@@ -247,7 +250,10 @@ class Indexer:
             return None
         if kind == "image":
             return self._prepare_image(path, file_id, force)
-        self._index_document(path, file_id)
+        if kind in (AUDIO, VIDEO):
+            self._index_media(path, file_id, kind)
+        else:
+            self._index_document(path, file_id)
         catalog.dequeue(path)
         self._retries.pop(path, None)
         return None
@@ -255,6 +261,10 @@ class Indexer:
     def _too_large(self, kind: str, size: int, path: str) -> bool:
         if kind == "image":
             return size > self._settings.max_image_bytes
+        if kind == AUDIO:
+            return size > self._settings.max_audio_bytes
+        if kind == VIDEO:
+            return size > self._settings.max_video_bytes
         if os.path.splitext(path)[1].lower() in OFFICE_EXTS:
             return size > self._settings.max_office_bytes
         return size > self._settings.max_document_bytes
@@ -300,6 +310,61 @@ class Indexer:
         self._last_work = time.monotonic()
         vectors = self._embedder.encode_documents([text for _, text in pairs])
         self._vectors.add(TEXT, [chunk_id for chunk_id, _ in pairs], [file_id] * len(pairs), vectors)
+        self._dirty = True
+
+    # ---- audio and video -----------------------------------------------------------------------
+
+    def _index_media(self, path: str, file_id: int, kind: str) -> None:
+        """A video gets one vector for its pictures and one for its sound, whichever it has."""
+        pictures = self._embed_pictures(path, file_id) if kind == VIDEO else False
+        try:
+            sound = self._embed_sound(path, file_id)
+        except DecodeError as error:
+            # Sound in a format we can't read shouldn't lose the pictures we already have.
+            if not pictures:
+                raise
+            log.info("could not read the sound of %s: %s", path, error)
+            sound = False
+        if pictures or sound:
+            self._catalog.finish_file(file_id, "full")
+        else:
+            self._catalog.finish_file(file_id, "name_only", "no_content")
+
+    def _embed_pictures(self, path: str, file_id: int) -> bool:
+        settings = self._settings
+        if settings.video_seconds == 0:
+            return False
+        frames = read_frames(
+            path,
+            settings.video_seconds,
+            settings.video_max_frames,
+            settings.video_frames_per_second,
+            settings.video_long_side,
+            settings.blank_std,
+        )
+        if not frames:
+            return False
+        self._add_media_vector(VIDEO, file_id, self._embedder.encode_video(frames))
+        return True
+
+    def _embed_sound(self, path: str, file_id: int) -> bool:
+        settings = self._settings
+        if settings.audio_seconds == 0:
+            return False
+        samples = read_audio(path, settings.audio_seconds)
+        if (
+            samples is None
+            or samples.size < settings.audio_min_seconds * SAMPLE_RATE
+            or float(np.sqrt(np.mean(np.square(samples)))) < settings.audio_silence_rms
+        ):
+            return False
+        self._add_media_vector(AUDIO, file_id, self._embedder.encode_audio(samples))
+        return True
+
+    def _add_media_vector(self, kind: str, file_id: int, vectors: np.ndarray) -> None:
+        self._model_loaded = True
+        self._last_work = time.monotonic()
+        self._vectors.add(kind, [file_id], [file_id], vectors)
         self._dirty = True
 
     # ---- images ------------------------------------------------------------------------------

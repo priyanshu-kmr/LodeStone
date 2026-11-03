@@ -10,11 +10,15 @@ import numpy as np
 
 from .catalog import Catalog, FileRow, query_terms, term_coverage
 from .config import SETTINGS, Settings, is_under
-from .vectors import IMAGE, TEXT, VectorHit, VectorStore
+from .vectors import TEXT, VECTOR_KINDS, VectorHit, VectorStore
 
 ALL = "all"
 IMAGES = "images"
 DOCUMENTS = "documents"
+VIDEOS = "videos"
+AUDIO = "audio"
+# The kind of file each of these filters keeps. Documents are whatever is left over.
+_MODE_KINDS = {IMAGES: "image", VIDEOS: "video", AUDIO: "audio"}
 
 _LEAD = r"^(?:please\s+)?(?:(?:find|show|search(?:\s+for)?|get|open|look\s+for)\s+(?:me\s+)?)?(?:(?:the|an?|my)\s+)?"
 _LINK = (
@@ -25,6 +29,8 @@ _IMAGE_QUERY = re.compile(
     _LEAD + r"(?:images?|photos?|pictures?|pics?|screenshots?)\b" + _LINK, re.IGNORECASE
 )
 _DOC_QUERY = re.compile(_LEAD + r"(?:documents?|docs?|pdfs?)\b" + _LINK, re.IGNORECASE)
+_VIDEO_QUERY = re.compile(_LEAD + r"(?:videos?|movies?)\b" + _LINK, re.IGNORECASE)
+_AUDIO_QUERY = re.compile(_LEAD + r"(?:audio|recordings?|songs?|sounds?)\b" + _LINK, re.IGNORECASE)
 _FILE_QUERY = re.compile(_LEAD + r"files?\b" + _LINK, re.IGNORECASE)
 
 
@@ -53,7 +59,13 @@ class SearchResult:
 def parse_query(query: str, mode: str = ALL) -> ParsedQuery:
     """Strip filler like 'file which contains', and treat 'image of' as an image filter."""
     query = " ".join(query.split())
-    for pattern, implied in ((_IMAGE_QUERY, IMAGES), (_DOC_QUERY, DOCUMENTS), (_FILE_QUERY, ALL)):
+    for pattern, implied in (
+        (_IMAGE_QUERY, IMAGES),
+        (_DOC_QUERY, DOCUMENTS),
+        (_VIDEO_QUERY, VIDEOS),
+        (_AUDIO_QUERY, AUDIO),
+        (_FILE_QUERY, ALL),
+    ):
         match = pattern.match(query)
         if match:
             rest = query[match.end() :].strip()
@@ -123,19 +135,16 @@ class Searcher:
         snippet_chunks: dict[int, int] = {}
 
         vector = self._encoder.encode_query(parsed.text)
-        text_hits = self._vectors.search(TEXT, vector, limit)
-        image_hits = self._vectors.search(IMAGE, vector, limit)
-        for hit in text_hits:  # Best first, so each file keeps its most relevant passage.
+        hits = {kind: self._vectors.search(kind, vector, limit) for kind in VECTOR_KINDS}
+        for hit in hits[TEXT]:  # Best first, so each file keeps its most relevant passage.
             snippet_chunks.setdefault(hit.file_id, hit.row_id)
 
         # One 'meaning' ranking: for each file, whichever of its vectors stands out the most.
         spread = self._settings.min_score_spread
-        by_text = standout_scores(_best_per_file(text_hits), spread)
-        by_image = standout_scores(_best_per_file(image_hits), spread)
-        meaning = {
-            file_id: max(by_text.get(file_id, -np.inf), by_image.get(file_id, -np.inf))
-            for file_id in by_text.keys() | by_image.keys()
-        }
+        meaning: dict[int, float] = {}
+        for kind_hits in hits.values():
+            for file_id, score in standout_scores(_best_per_file(kind_hits), spread).items():
+                meaning[file_id] = max(meaning.get(file_id, -np.inf), score)
         lists = {"meaning": sorted(meaning, key=lambda i: meaning[i], reverse=True)}
 
         keyword_files, keyword_weights = self._keyword_list(parsed.text, limit, snippet_chunks)
@@ -211,8 +220,8 @@ class Searcher:
 
     @staticmethod
     def _keep(row: FileRow, mode: str, inactive: list[str]) -> bool:
-        if mode == IMAGES and row.kind != "image":
+        if mode in _MODE_KINDS and row.kind != _MODE_KINDS[mode]:
             return False
-        if mode == DOCUMENTS and row.kind == "image":
+        if mode == DOCUMENTS and row.kind in _MODE_KINDS.values():
             return False
         return not any(is_under(row.path, folder) for folder in inactive)

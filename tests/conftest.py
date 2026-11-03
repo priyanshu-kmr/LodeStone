@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import re
+import wave
 from pathlib import Path
+from typing import Callable
 
+import av
 import numpy as np
 import pytest
 from PIL import Image
@@ -29,10 +32,18 @@ def word_vector(text: str) -> np.ndarray:
     return _unit(vector)
 
 
+def _colour_label(image: Image.Image) -> str:
+    """Pictures are labelled by their average colour, which tests can search for."""
+    r, g, b = np.asarray(image.convert("RGB")).reshape(-1, 3).mean(axis=0)
+    return "red" if r > g and r > b else "green" if g > b else "blue"
+
+
 class FakeEmbedder:
     def __init__(self) -> None:
         self.image_calls = 0
         self.document_calls = 0
+        self.video_lengths: list[int] = []
+        self.audio_lengths: list[int] = []
         self.released = 0
         self.gpu_settings: list[bool] = []
         self.warm_ups = 0
@@ -50,13 +61,15 @@ class FakeEmbedder:
         self.image_calls += 1
         if self.fail_on_size and any(i.size == self.fail_on_size for i in images):
             raise RuntimeError("bad image")
-        vectors = []
-        for image in images:
-            # Images are labelled by their average colour, which tests can search for.
-            r, g, b = np.asarray(image.convert("RGB")).reshape(-1, 3).mean(axis=0)
-            label = "red" if r > g and r > b else "green" if g > b else "blue"
-            vectors.append(word_vector(label))
-        return np.stack(vectors)
+        return np.stack([word_vector(_colour_label(image)) for image in images])
+
+    def encode_video(self, frames: list[Image.Image]) -> np.ndarray:
+        self.video_lengths.append(len(frames))
+        return np.stack([word_vector(_colour_label(frames[0]))])
+
+    def encode_audio(self, samples: np.ndarray) -> np.ndarray:
+        self.audio_lengths.append(len(samples))
+        return np.stack([word_vector("humming tone")])
 
     def release_index_model(self) -> None:
         self.released += 1
@@ -92,6 +105,52 @@ def textured(size: tuple[int, int], colour: tuple[int, int, int], seed: int = 0)
     noise = rng.integers(-40, 40, (size[1], size[0], 3))
     pixels = np.clip(np.array(colour) + noise, 0, 255).astype(np.uint8)
     return Image.fromarray(pixels)
+
+
+def write_wav(path: Path, seconds: float, amplitude: float = 0.3, rate: int = 44_100, channels: int = 2) -> None:
+    """A real sound file at a rate and layout that the app has to convert."""
+    count = int(seconds * rate)
+    tone = amplitude * np.sin(2 * np.pi * 220 * np.arange(count) / rate)
+    samples = np.repeat((tone * 32767).astype(np.int16), channels)
+    with wave.open(str(path), "wb") as file:
+        file.setnchannels(channels)
+        file.setsampwidth(2)
+        file.setframerate(rate)
+        file.writeframes(samples.tobytes())
+
+
+def write_video(
+    path: Path,
+    seconds: int,
+    colour_at: Callable[[float], tuple[int, int, int]],
+    with_sound: bool = False,
+    fps: int = 10,
+) -> None:
+    """A real video file. It has noise in it, because blank frames get skipped."""
+    rng = np.random.default_rng(0)
+    with av.open(str(path), "w") as container:
+        video = container.add_stream("mpeg4", rate=fps)
+        video.width, video.height, video.pix_fmt = 320, 240, "yuv420p"
+        # A keyframe only every 5 seconds, so samples between them have to be decoded to.
+        video.gop_size = fps * 5
+        audio = container.add_stream("aac", rate=44_100) if with_sound else None
+        for index in range(seconds * fps):
+            noise = rng.integers(-30, 30, (240, 320, 3))
+            pixels = np.clip(np.array(colour_at(index / fps)) + noise, 0, 255).astype(np.uint8)
+            frame = av.VideoFrame.from_ndarray(pixels, format="rgb24")
+            frame.pts = index
+            container.mux(video.encode(frame))
+        container.mux(video.encode())
+        if audio is not None:
+            count = 44_100 * seconds
+            tone = 0.3 * np.sin(2 * np.pi * 220 * np.arange(count) / 44_100).astype(np.float32)
+            for start in range(0, count, 1024):
+                part = tone[start : start + 1024].reshape(1, -1).astype(np.float32)
+                frame = av.AudioFrame.from_ndarray(part, format="fltp", layout="mono")
+                frame.sample_rate = 44_100
+                frame.pts = start
+                container.mux(audio.encode(frame))
+            container.mux(audio.encode())
 
 
 @pytest.fixture

@@ -13,7 +13,7 @@ import numpy as np
 import pytest
 from PIL import Image, ImageDraw, ImageFont
 
-from lodestone.config import Settings
+from lodestone.config import MEDIA_SECONDS_MAX, Settings
 
 pytestmark = pytest.mark.models
 
@@ -162,6 +162,68 @@ def test_gpu_and_cpu_vectors_match_when_a_gpu_is_available() -> None:
     assert float(np.dot(image_cpu, image_gpu)) > 0.99
     fresh.set_use_gpu(False)
     assert fresh._query_model is None and fresh._index_model is None
+
+
+def test_indexing_only_loads_the_audio_encoder_once_it_is_needed() -> None:
+    from lodestone.embedder import GemmaEmbedder
+
+    fresh = GemmaEmbedder()
+    fresh.encode_images([_photo(5)])
+    assert not hasattr(fresh._index_model[0].model, "audio_tower") or fresh._index_model[0].model.audio_tower is None
+    before = fresh.encode_images([_photo(5)])[0]
+    fresh.encode_audio(_speech(3))
+    assert fresh._index_has_audio
+    after = fresh.encode_images([_photo(5)])[0]
+    assert float(np.dot(before, after)) > 0.999  # The larger model must not change image vectors.
+    fresh.release_index_model()
+    assert fresh._index_model is None and not fresh._index_has_audio
+
+
+def _speech(seconds: float) -> np.ndarray:
+    """Not real speech, just a changing signal that the audio encoder can tell apart from silence."""
+    rng = np.random.default_rng(0)
+    return (0.2 * rng.standard_normal(int(seconds * 16_000))).astype(np.float32)
+
+
+def test_the_longest_audio_duration_works_and_reaches_the_end_of_the_clip(embedder) -> None:
+    """By default the library cuts audio off at 30 seconds, without saying so."""
+    quiet = np.zeros(MEDIA_SECONDS_MAX * 16_000, dtype=np.float32)
+    ending = quiet.copy()
+    ending[-int(10 * 16_000) :] = _speech(10)
+    silence_vector = embedder.encode_audio(quiet)[0]
+    ending_vector = embedder.encode_audio(ending)[0]
+    assert np.isfinite(ending_vector).all()
+    assert np.linalg.norm(ending_vector) == pytest.approx(1.0, abs=1e-5)
+    assert float(np.dot(silence_vector, ending_vector)) < 0.99
+
+
+def test_the_most_frames_fit_even_at_the_costliest_shape(embedder) -> None:
+    """Most shapes round down to fewer than 140 tokens a frame. This one uses all of them."""
+    settings = Settings()
+    frames = [_photo(i).resize((960, 336)) for i in range(settings.video_max_frames)]
+    vector = embedder.encode_video(frames)
+    assert vector.shape == (1, 768)
+    assert np.isfinite(vector).all()
+
+
+def test_text_finds_the_right_video_and_audio() -> None:
+    """They share one space with search queries, whichever encoder made the vector."""
+    from lodestone.embedder import GemmaEmbedder
+
+    fresh = GemmaEmbedder()
+    font = ImageFont.truetype("C:/Windows/Fonts/arial.ttf", 54)
+
+    def clip(label: str, colour: tuple[int, int, int]) -> list[Image.Image]:
+        image = Image.new("RGB", (640, 360), colour)
+        ImageDraw.Draw(image).text((30, 140), label, fill="white", font=font)
+        return [image] * 4
+
+    videos = {
+        "beach": fresh.encode_video(clip("BEACH HOLIDAY", (30, 120, 200)))[0],
+        "invoice": fresh.encode_video(clip("INVOICE TOTAL DUE", (60, 60, 60)))[0],
+    }
+    query = fresh.encode_query("beach holiday")
+    assert float(np.dot(query, videos["beach"])) > float(np.dot(query, videos["invoice"]))
 
 
 def test_ocr_reads_printed_text_and_ignores_blank_images() -> None:
