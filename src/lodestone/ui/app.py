@@ -807,10 +807,10 @@ class SettingsDialog(QDialog):
         row.addWidget(self.token_value)
         row.addWidget(self.token_apply)
         hint = QLabel(
-            "How much of each file is embedded, for finding it by meaning. The default is "
-            f"{SETTINGS.embed_token_limit}. Higher finds more in long files, but indexing gets slower "
-            "and the index larger. At 0, documents are only found by exact words and filename, "
-            "and scanned PDFs aren't read."
+            "Tokens embedded per file for semantic search. Default: "
+            f"{SETTINGS.embed_token_limit}. Higher values improve long-file retrieval but slow indexing "
+            "and increase index size. At 0, only exact words and filenames are searchable; scanned PDFs "
+            "are not read."
         )
         hint.setWordWrap(True)
         hint.setObjectName("statusText")
