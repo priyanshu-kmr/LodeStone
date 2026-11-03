@@ -15,12 +15,11 @@ but uses up to about 4 GB of VRAM. Models unload when idle: indexing after 1 min
 The index is in `%LOCALAPPDATA%\LodeStone` and holds copies of your documents' text.
 
 ## Setup
-
+Run these commands in the root of this directory. After running them run `LodeStone.bat`
 ```
 uv venv --python 3.12 .venv
 uv pip install --python .venv\Scripts\python.exe torch torchvision --index-url https://download.pytorch.org/whl/cu130
 uv pip install --python .venv\Scripts\python.exe -e ".[dev]"
-.venv\Scripts\python.exe -m pytest
 ```
 
 ## How it works
