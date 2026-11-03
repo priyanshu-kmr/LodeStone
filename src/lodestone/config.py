@@ -28,6 +28,10 @@ SKIP_DIRS = {
 TEMP_PREFIXES = ("~$", ".~")
 TEMP_SUFFIXES = (".tmp", ".temp", ".crdownload", ".part", ".partial", ".download")
 
+# The range offered in Settings for embed_token_limit.
+TOKEN_LIMIT_MAX = 5000
+TOKEN_LIMIT_STEP = 100
+
 # Personal project datasets, relative to the home folder. Seeded once on first run and
 # editable in Settings afterwards.
 SEED_EXCLUDES = (

@@ -11,11 +11,12 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QEvent, QObject  # noqa: E402
-from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox, QWidget  # noqa: E402
+from PySide6.QtCore import QEvent, QObject, Qt  # noqa: E402
+from PySide6.QtTest import QTest  # noqa: E402
+from PySide6.QtWidgets import QApplication, QFileDialog, QLabel, QMessageBox, QWidget  # noqa: E402
 
 from conftest import FakeEmbedder, FakeOcr, textured  # noqa: E402
-from lodestone.config import Settings  # noqa: E402
+from lodestone.config import TOKEN_LIMIT_STEP, Settings  # noqa: E402
 from lodestone.engine import Engine  # noqa: E402
 from lodestone.ui.app import STYLE, SearchWindow, SettingsDialog  # noqa: E402
 
@@ -191,6 +192,160 @@ def test_gpu_checkbox_starts_off_and_saves_the_choice(qapp, engine) -> None:
     assert engine.embedder.gpu_settings == [True]
     dialog.close()
     finish(window, qapp)
+
+
+def _yes(*args, **kwargs):
+    return QMessageBox.StandardButton.Yes
+
+
+def _cancel(*args, **kwargs):
+    return QMessageBox.StandardButton.Cancel
+
+
+@pytest.fixture
+def index_tab(qapp, engine, library):
+    (library / "notes.txt").write_text("We discussed system design and ownership.")
+    drain(engine)
+    window = SearchWindow(engine)
+    dialog = SettingsDialog(engine, window)
+    dialog.refresh()
+    yield dialog
+    dialog.close()
+    finish(window, qapp)
+
+
+def test_file_types_can_be_added_and_removed(qapp, engine, library, index_tab) -> None:
+    dialog = index_tab
+    (library / "tool.py").write_text("def quarterly_budget(): pass")
+    dialog.type_input.setText("*.PY, xml")
+    dialog._add_types()
+    assert wait_for(qapp, lambda: dialog.type_list.count() == 2)
+    assert dialog.type_input.text() == ""
+    assert engine.custom_exts() == [".py", ".xml"]
+    drain(engine)
+    assert engine.catalog.get_file(str(library / "tool.py")).status == "indexed"
+
+    dialog.type_list.setCurrentRow(0)
+    dialog._remove_type()
+    assert wait_for(qapp, lambda: dialog.type_list.count() == 1)
+    drain(engine)
+    assert engine.catalog.get_file(str(library / "tool.py")) is None
+
+
+def test_file_type_message_mentions_text_and_ocr(index_tab) -> None:
+    texts = [label.text() for label in index_tab.findChildren(QLabel)]
+    message = next(text for text in texts if "Search inside more file types" in text)
+    assert "plain text" in message and "OCR" in message
+
+
+def test_bad_file_type_is_explained_and_nothing_is_saved(qapp, engine, index_tab, monkeypatch) -> None:
+    dialog = index_tab
+    seen = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: seen.append(a[2]))
+    dialog.type_input.setText(".py, .pdf")
+    dialog._add_types()
+    assert "already handles .pdf" in seen[0]
+    assert dialog.type_input.text() == ".py, .pdf"
+    dialog.window_.pool.waitForDone(2000)
+    assert engine.custom_exts() == []
+
+
+def test_enter_in_the_file_type_box_only_adds_the_type(qapp, engine, index_tab, monkeypatch) -> None:
+    dialog = index_tab
+    opened = []
+    monkeypatch.setattr(QFileDialog, "getExistingDirectory", lambda *a, **k: opened.append(True) or "")
+    dialog.show()
+    dialog.type_input.setText(".py")
+    QTest.keyClick(dialog.type_input, Qt.Key.Key_Return)
+    assert wait_for(qapp, lambda: dialog.type_list.count() == 1)
+    assert dialog.isVisible()
+    assert opened == []
+
+
+def test_slider_starts_at_the_limit_and_covers_the_range(index_tab) -> None:
+    dialog = index_tab
+    assert dialog.token_slider.value() * TOKEN_LIMIT_STEP == 500
+    assert "500 tokens" in dialog.token_value.text()
+    assert not dialog.token_apply.isEnabled()
+    assert dialog.token_slider.minimum() == 0
+    assert dialog.token_slider.maximum() * TOKEN_LIMIT_STEP == 5000
+
+
+def test_changing_the_token_limit_prompts_then_reindexes(qapp, engine, index_tab, monkeypatch) -> None:
+    dialog = index_tab
+    seen = []
+
+    def accept(*args, **kwargs):
+        seen.append(args[2])
+        return QMessageBox.StandardButton.Yes
+
+    calls = engine.embedder.document_calls
+    dialog.token_slider.setValue(30)
+    assert "3,000 tokens" in dialog.token_value.text()
+    assert dialog.token_apply.isEnabled()
+    assert engine.token_limit == 500  # Nothing changes until it's confirmed.
+
+    monkeypatch.setattr(QMessageBox, "question", accept)
+    dialog.token_apply.click()
+    assert "3,000 tokens" in seen[0]
+    assert wait_for(qapp, lambda: "Reindexing" in dialog.index_note.text())
+    assert engine.token_limit == 3000
+    assert not dialog.token_apply.isEnabled()
+    drain(engine)
+    assert engine.embedder.document_calls == calls + 1
+
+
+def test_cancelling_the_prompt_puts_the_slider_back(qapp, engine, index_tab, monkeypatch) -> None:
+    dialog = index_tab
+    calls = engine.embedder.document_calls
+    monkeypatch.setattr(QMessageBox, "question", _cancel)
+    dialog.token_slider.setValue(30)
+    dialog.token_apply.click()
+    assert dialog.token_slider.value() * TOKEN_LIMIT_STEP == 500
+    assert engine.token_limit == 500
+    assert not dialog.token_apply.isEnabled()
+    drain(engine)
+    assert engine.embedder.document_calls == calls
+
+
+def test_reindex_button_asks_first(qapp, engine, index_tab, monkeypatch) -> None:
+    dialog = index_tab
+    calls = engine.embedder.document_calls
+    monkeypatch.setattr(QMessageBox, "question", _cancel)
+    dialog.reindex_button.click()
+    drain(engine)
+    assert engine.embedder.document_calls == calls
+
+    monkeypatch.setattr(QMessageBox, "question", _yes)
+    dialog.reindex_button.click()
+    assert wait_for(qapp, lambda: "Reindexing" in dialog.index_note.text())
+    assert dialog.reindex_button.isEnabled()
+    drain(engine)
+    assert engine.embedder.document_calls == calls + 1
+
+
+def test_delete_button_asks_first_then_pauses(qapp, engine, index_tab, monkeypatch) -> None:
+    dialog = index_tab
+    monkeypatch.setattr(QMessageBox, "warning", _cancel)
+    dialog.delete_button.click()
+    assert wait_for(qapp, lambda: True, timeout=0.1)
+    dialog.window_.pool.waitForDone(2000)
+    assert engine.status().indexed == 1 and not engine.paused
+
+    monkeypatch.setattr(QMessageBox, "warning", _yes)
+    dialog.delete_button.click()
+    assert wait_for(qapp, lambda: "Index deleted" in dialog.index_note.text())
+    assert engine.status().indexed == 0
+    assert engine.paused and dialog.pause.isChecked()
+    assert dialog.delete_button.isEnabled()
+
+    # The rescan queues everything again, but nothing runs yet and the folder list says so.
+    engine.scan_all()
+    dialog.refresh_counts()
+    assert wait_for(qapp, lambda: dialog.folder_tree.topLevelItem(0).text(2) == "Paused, 1 to go")
+
+    dialog.pause.setChecked(False)
+    assert wait_for(qapp, lambda: not engine.paused)
 
 
 def test_status_says_when_the_search_model_is_loading(qapp, engine, library) -> None:

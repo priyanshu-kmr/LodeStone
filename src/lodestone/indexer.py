@@ -77,6 +77,9 @@ class Indexer:
 
     # ---- public entry points --------------------------------------------------------------
 
+    def set_settings(self, settings: Settings) -> None:
+        self._settings = settings
+
     def run_batch(self) -> int:
         """Process one batch of ready paths. Returns how many it handled."""
         paths = self._catalog.next_tasks(self._settings.image_batch_size * 2)
@@ -161,7 +164,7 @@ class Indexer:
             except OSError:
                 self._catalog.dequeue(path)
                 return
-            kind = kind_of(path) or "document"
+            kind = kind_of(path, self._catalog.custom_exts()) or "document"
             file_id = self._catalog.start_file(path, kind, info.st_size, info.st_mtime_ns, None)
         else:
             file_id = current.id
@@ -185,7 +188,7 @@ class Indexer:
             catalog.dequeue(path)
             return None
         enabled = [f.path for f in folders if f.enabled]
-        kind = kind_of(path)
+        kind = kind_of(path, catalog.custom_exts())
         pending = [p.path for p in catalog.dataset_prompts("pending")]
         blocked = catalog.excludes() + pending
         if (

@@ -6,8 +6,11 @@ import os
 import re
 import stat
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Callable, Collection, Iterable
+
+from PIL import Image
 
 from .config import (
     DOCUMENT_EXTS,
@@ -38,9 +41,15 @@ _DATASET_FILE_NAMES = {
     "classes.txt", "data.yaml",
 }
 _CODE_MARKERS = {".git", "src", "requirements.txt", "pyproject.toml", "setup.py"}
+_VALID_EXT = re.compile(r"\.[a-z0-9_+\-]+")
 
 
-def kind_of(path: str) -> str | None:
+@lru_cache(maxsize=1)
+def _pillow_exts() -> frozenset[str]:
+    return frozenset(Image.registered_extensions())
+
+
+def kind_of(path: str, extra_exts: Collection[str] = ()) -> str | None:
     ext = os.path.splitext(path)[1].lower()
     if ext in DOCUMENT_EXTS:
         return "document"
@@ -48,7 +57,30 @@ def kind_of(path: str) -> str | None:
         return "image"
     if ext in NAME_ONLY_EXTS:
         return "name_only"
+    if ext in extra_exts:
+        # An image goes through OCR. Anything else is read as text.
+        return "image" if ext in _pillow_exts() else "document"
     return None
+
+
+def parse_exts(text: str) -> list[str]:
+    """Turn what someone typed, like '*.XML, py', into extensions.
+
+    Raises ValueError with a message written for them.
+    """
+    exts: list[str] = []
+    for part in re.split(r"[,;\s]+", text.strip()):
+        if not part:
+            continue
+        ext = "." + part.lower().lstrip("*.")
+        if not _VALID_EXT.fullmatch(ext):
+            raise ValueError(f'"{part}" doesn\'t look like a file type. Try something like .xml or .py.')
+        if ext in DOCUMENT_EXTS or ext in IMAGE_EXTS or ext in NAME_ONLY_EXTS:
+            raise ValueError(f"LodeStone already handles {ext} files.")
+        if ext in TEMP_SUFFIXES:
+            raise ValueError(f"{ext} files are temporary, so LodeStone always skips them.")
+        exts.append(ext)
+    return exts
 
 
 def is_temp_file(name: str) -> bool:
@@ -120,6 +152,7 @@ def walk(
     root: str,
     excludes: Iterable[str] = (),
     should_stop: Callable[[], bool] | None = None,
+    extra_exts: Collection[str] = (),
 ) -> tuple[list[FileEntry], _DirStats]:
     """Read file details only, never contents, so this stays light on a whole folder tree."""
     root = norm_path(root)
@@ -152,7 +185,7 @@ def walk(
                     current.children.append(child)
                     stack.append(child)
                     continue
-                kind = kind_of(entry.name)
+                kind = kind_of(entry.name, extra_exts)
                 if kind is None or is_temp_file(entry.name):
                     continue
                 info = entry.stat(follow_symlinks=False)
@@ -247,8 +280,9 @@ def scan_root(
     excludes: Iterable[str] = (),
     settings: Settings = SETTINGS,
     should_stop: Callable[[], bool] | None = None,
+    extra_exts: Collection[str] = (),
 ) -> ScanResult:
-    files, top = walk(root, excludes, should_stop)
+    files, top = walk(root, excludes, should_stop, extra_exts)
     return ScanResult(norm_path(root), files, find_datasets(top, settings))
 
 
@@ -263,9 +297,11 @@ class FolderEstimate:
         return self.documents + self.images
 
 
-def estimate_folder(path: str, excludes: Iterable[str] = ()) -> FolderEstimate:
+def estimate_folder(
+    path: str, excludes: Iterable[str] = (), extra_exts: Collection[str] = ()
+) -> FolderEstimate:
     """Count files before indexing, so the UI can warn about very large folders."""
-    files, _ = walk(path, excludes)
+    files, _ = walk(path, excludes, extra_exts=extra_exts)
     images = sum(f.kind == "image" for f in files)
     resolved = Path(norm_path(path))
     return FolderEstimate(len(files) - images, images, resolved == Path(resolved.anchor))

@@ -199,6 +199,13 @@ class Catalog:
                 (key, value),
             )
 
+    def custom_exts(self) -> frozenset[str]:
+        value = self.get_meta("custom_exts")
+        return frozenset(value.split(",")) if value else frozenset()
+
+    def set_custom_exts(self, exts: Iterable[str]) -> None:
+        self.set_meta("custom_exts", ",".join(sorted(exts)))
+
     # ---- folders --------------------------------------------------------------------------
 
     def add_folder(self, path: str, is_default: bool = False) -> None:
@@ -434,6 +441,28 @@ class Catalog:
             self._conn.execute("UPDATE files SET status='pending' WHERE status='error'")
         self.enqueue_many(paths, PRIORITY_SCAN)
         return len(paths)
+
+    def mark_for_reindex(self, text_only: bool = False) -> None:
+        """A pending file gets redone when a scan next finds it, and stays searchable until then."""
+        where = (
+            " WHERE kind='document' OR id IN (SELECT file_id FROM chunks WHERE source='ocr')"
+            if text_only
+            else ""
+        )
+        with self._write_lock, self._conn:
+            self._conn.execute("UPDATE files SET status='pending'" + where)
+
+    def clear_index(self) -> None:
+        """Forget every file. Folders, excludes and settings stay."""
+        with self._write_lock:
+            with self._conn:
+                self._conn.execute("DELETE FROM queue")
+                self._conn.execute("DELETE FROM files")
+                # Deleting from FTS5 row by row only adds tombstones, so empty it outright.
+                self._conn.execute("INSERT INTO chunks_fts(chunks_fts) VALUES('delete-all')")
+            # Without these, the file stays the same size and the space is only reused later.
+            self._conn.execute("VACUUM")
+            self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
 
     def touch_file(self, file_id: int, size: int, mtime_ns: int) -> None:
         with self._write_lock, self._conn:

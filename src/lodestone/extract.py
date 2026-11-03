@@ -34,6 +34,9 @@ def read_text_file(path: str, settings: Settings = SETTINGS) -> str:
         raw = handle.read(settings.max_text_bytes)
     if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
         return raw.decode("utf-16", errors="replace")
+    # Not really text, which is likely for a file type the user added. It stays findable by name.
+    if b"\0" in raw[:8192]:
+        return ""
     try:
         return raw.decode("utf-8-sig")
     except UnicodeDecodeError:

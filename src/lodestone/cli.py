@@ -23,6 +23,7 @@ def _print_status(engine: Engine) -> None:
 
 def _index(args: argparse.Namespace) -> int:
     engine = Engine(watch=False)
+    engine.set_paused(False)  # Asking to index overrides a pause left on in the app.
     if args.folder:
         for folder in args.folder:
             engine.add_folder(folder)

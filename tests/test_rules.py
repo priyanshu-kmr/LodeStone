@@ -14,7 +14,16 @@ from lodestone.catalog import fts_query, name_chunk_text
 from lodestone.config import Settings, is_under
 from lodestone.extract import chunk_text, read_text_file, within_embed_limit
 from lodestone.ocr import clean_lines
-from lodestone.scanner import find_datasets, is_cloud_only, is_temp_file, kind_of, path_allowed, scan_root, walk
+from lodestone.scanner import (
+    find_datasets,
+    is_cloud_only,
+    is_temp_file,
+    kind_of,
+    parse_exts,
+    path_allowed,
+    scan_root,
+    walk,
+)
 from lodestone.search import ALL, DOCUMENTS, IMAGES, parse_query, rrf_merge, standout_scores
 
 
@@ -89,6 +98,33 @@ class TestFolderRules:
         assert kind_of("photo.JPG") == "image"
         assert kind_of("old.doc") == "name_only"
         assert kind_of("setup.exe") is None
+
+    def test_added_types_are_text_unless_they_are_images(self) -> None:
+        added = {".py", ".jfif"}
+        assert kind_of("script.PY", added) == "document"
+        assert kind_of("photo.jfif", added) == "image"
+        assert kind_of("script.py") is None
+        assert kind_of("old.doc", {".doc"}) == "name_only"  # Added types never override built-in ones.
+
+    def test_typed_file_types_are_cleaned_up(self) -> None:
+        assert parse_exts("*.XML, py;.log4j  .c++") == [".xml", ".py", ".log4j", ".c++"]
+        assert parse_exts("  ") == []
+
+    @pytest.mark.parametrize(
+        ("typed", "complaint"),
+        [
+            ("tar.gz", "doesn't look like"),
+            ("my file?", "doesn't look like"),
+            (".", "doesn't look like"),
+            (".PDF", "already handles"),
+            (".doc", "already handles"),
+            (".heic", "already handles"),
+            (".tmp", "temporary"),
+        ],
+    )
+    def test_file_types_that_cannot_work_are_explained(self, typed: str, complaint: str) -> None:
+        with pytest.raises(ValueError, match=complaint):
+            parse_exts(typed)
 
     def test_temp_files(self) -> None:
         assert is_temp_file("~$report.docx")
@@ -192,6 +228,11 @@ class TestText:
             path = tmp_path / f"{encoding}.txt"
             path.write_text(sample, encoding=encoding)
             assert read_text_file(str(path)) == sample
+
+    def test_binary_file_reads_as_no_text(self, tmp_path: Path) -> None:
+        path = tmp_path / "archive.zip"
+        path.write_bytes(b"PK\x03\x04\x00\x00binary data")
+        assert read_text_file(str(path)) == ""
 
     def test_name_chunk_splits_words(self) -> None:
         text = name_chunk_text(r"C:\work\Job Search\interview_notes-final.pdf")

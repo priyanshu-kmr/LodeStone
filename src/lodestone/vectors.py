@@ -57,10 +57,17 @@ class VectorStore:
                 ("vector", pa.list_(pa.float32(), dim)),
             ]
         )
-        self._tables = {kind: self._open(_table_name(kind, model_id)) for kind in (TEXT, IMAGE)}
+        self._names = {kind: _table_name(kind, model_id) for kind in (TEXT, IMAGE)}
+        self._tables = {kind: self._open(name) for kind, name in self._names.items()}
 
     def _open(self, name: str):
         return self._db.create_table(name, schema=self._schema, exist_ok=True)
+
+    def clear(self) -> None:
+        """Drop the tables rather than deleting rows, so the disk space comes back right away."""
+        with self._lock:
+            self._db.drop_all_tables()
+            self._tables = {kind: self._open(name) for kind, name in self._names.items()}
 
     def count(self, kind: str) -> int:
         return self._tables[kind].count_rows()

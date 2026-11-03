@@ -38,11 +38,22 @@ uv pip install --python .venv\Scripts\python.exe -e ".[dev]"
 
 ## Limits
 
-- Only about the first 500 tokens of each file are embedded (`embed_token_limit` in `config.py`).
+- Only about the first 500 tokens of each file are embedded. **Settings > Index > Token limit**
+  changes this from 0 to 5,000, and reindexes your documents.
 - OCR on a scanned PDF stops at the same limit, so later scanned pages aren't searchable.
 - Images under 200x200 px on both sides, or blank, very blurry or unreadable, are found by filename
   only. **Settings > Name-only images** can override this.
-- `.doc`, `.ppt`, `.xls`, `.rtf` and `.heic` are found by filename only. Code files aren't indexed.
+- `.doc`, `.ppt`, `.xls`, `.rtf` and `.heic` are found by filename only.
+- Code files aren't indexed unless you add their type under **Settings > Index > Extra file types**.
+  Added types need to be plain text, or images that OCR can read. Anything else is found by filename.
+
+## Managing the index
+
+**Settings > Index** has two buttons. Your files are never touched by either.
+
+- **Reindex** reads and embeds every file again. Search keeps working while it runs.
+- **Delete index** forgets everything and frees the disk space, but keeps your folders and settings.
+  Indexing stays paused afterwards, so nothing is rebuilt until you turn off **Pause indexing**.
 
 ## License
 

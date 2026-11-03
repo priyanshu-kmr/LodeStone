@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import threading
 import time
 from pathlib import Path
 
@@ -594,6 +595,359 @@ class TestSeeding:
         engine.remove_folder(str(library))
         engine.seed_defaults()
         assert engine.folders() == []
+
+
+class TestCustomFileTypes:
+    def test_added_type_is_searched_by_content_and_removing_it_forgets_it(self, engine, library) -> None:
+        path = library / "layout.xml"
+        path.write_text("<config>quarterly budget spreadsheet</config>")
+        sync(engine)
+        assert engine.catalog.get_file(str(path)) is None
+
+        engine.add_custom_exts([".xml"])
+        sync(engine)
+        assert engine.custom_exts() == [".xml"]
+        assert engine.catalog.get_file(str(path)).kind == "document"
+        assert names(engine.search("quarterly budget"))[0] == "layout.xml"
+        assert engine.vectors.count(TEXT) == 1
+
+        engine.remove_custom_ext(".xml")
+        sync(engine)
+        assert engine.catalog.get_file(str(path)) is None
+        assert engine.vectors.count(TEXT) == 0
+        assert path.exists()
+
+    def test_added_image_type_goes_through_ocr(self, engine, library) -> None:
+        engine.indexer._ocr.text = "Invoice number 48213"
+        textured((640, 480), (220, 20, 20)).save(library / "scan.jfif", format="JPEG")
+        engine.add_custom_exts([".jfif"])
+        sync(engine)
+        assert engine.catalog.get_file(str(library / "scan.jfif")).kind == "image"
+        assert engine.vectors.count(IMAGE) == 1
+        assert names(engine.search("48213"))[0] == "scan.jfif"
+
+    def test_added_binary_type_is_found_by_name_only(self, engine, library) -> None:
+        (library / "holiday_clip.mp4").write_bytes(b"\x00\x00\x00\x18ftypmp42" * 100)
+        engine.add_custom_exts([".mp4"])
+        sync(engine)
+        row = engine.catalog.get_file(str(library / "holiday_clip.mp4"))
+        assert row.index_level == "name_only" and row.skip_reason == "no_text"
+        assert engine.vectors.count(TEXT) == 0
+        assert names(engine.search("holiday clip"))[0] == "holiday_clip.mp4"
+
+    def test_estimate_counts_added_types(self, engine, library) -> None:
+        (library / "a.py").write_text("print('hi')")
+        assert engine.estimate(str(library)).documents == 0
+        engine.add_custom_exts([".py"])
+        assert engine.estimate(str(library)).documents == 1
+
+    def test_added_types_survive_a_restart(self, paths, library, fast_settings) -> None:
+        first = Engine(paths, FakeEmbedder(), FakeOcr(), fast_settings, watch=False)
+        first.add_custom_exts([".py", ".xml"])
+        first.catalog.close()
+        second = Engine(paths, FakeEmbedder(), FakeOcr(), fast_settings, watch=False)
+        assert second.custom_exts() == [".py", ".xml"]
+
+    def test_watcher_picks_up_added_types(self, paths, library) -> None:
+        from lodestone.config import Settings
+
+        settings = Settings(debounce_seconds=0.2, delete_delay_seconds=0.2)
+        engine = Engine(paths, FakeEmbedder(), FakeOcr(), settings, watch=True)
+        engine.catalog.add_folder(str(library))
+        engine.add_custom_exts([".py"])
+        engine.start()
+        try:
+            assert engine.wait_until_idle(30)
+            (library / "tool.py").write_text("freshly written script")
+            assert _eventually(lambda: engine.search("freshly written"), 15)
+        finally:
+            engine.stop()
+
+
+def _long_text() -> str:
+    return "\n\n".join(f"paragraph {i} " + "words " * 150 for i in range(30))
+
+
+class TestTokenLimit:
+    def test_raising_it_embeds_more_after_reindexing(self, engine, library) -> None:
+        (library / "long.txt").write_text(_long_text())
+        sync(engine)
+        before = engine.vectors.count(TEXT)
+        engine.set_token_limit(5000)
+        sync(engine)
+        assert engine.token_limit == 5000
+        assert engine.vectors.count(TEXT) > before
+        assert engine.catalog.get_file(str(library / "long.txt")).status == "indexed"
+
+    def test_lowering_it_embeds_less(self, engine, library) -> None:
+        (library / "long.txt").write_text(_long_text())
+        sync(engine)
+        before = engine.vectors.count(TEXT)
+        engine.set_token_limit(100)
+        sync(engine)
+        assert 0 < engine.vectors.count(TEXT) < before
+
+    def test_zero_leaves_keyword_search_working(self, engine, library) -> None:
+        (library / "notes.txt").write_text("We discussed system design and ownership.")
+        sync(engine)
+        assert engine.vectors.count(TEXT) == 1
+        engine.set_token_limit(0)
+        sync(engine)
+        assert engine.vectors.count(TEXT) == 0
+        assert names(engine.search("system design"))[0] == "notes.txt"
+
+    def test_images_without_text_are_not_embedded_again(self, engine, library) -> None:
+        textured((640, 480), (220, 20, 20)).save(library / "photo.png")
+        (library / "notes.txt").write_text("We discussed system design and ownership.")
+        sync(engine)
+        assert engine.embedder.image_calls == 1
+        documents = engine.embedder.document_calls
+        engine.set_token_limit(1000)
+        sync(engine)
+        assert engine.embedder.image_calls == 1
+        assert engine.embedder.document_calls == documents + 1
+
+    def test_images_with_text_are_redone(self, engine, library) -> None:
+        engine.indexer._ocr.text = "Invoice number 48213 " * 200
+        textured((640, 480), (220, 20, 20)).save(library / "scan.png")
+        sync(engine)
+        before = engine.vectors.count(TEXT)
+        engine.set_token_limit(1000)
+        sync(engine)
+        assert engine.vectors.count(TEXT) > before
+
+    def test_it_survives_a_restart_without_undoing_the_work(self, paths, library, fast_settings) -> None:
+        (library / "long.txt").write_text(_long_text())
+        first = Engine(paths, FakeEmbedder(), FakeOcr(), fast_settings, watch=False)
+        first.catalog.add_folder(str(library))
+        first.set_token_limit(2000)
+        sync(first)
+        count = first.vectors.count(TEXT)
+        first.catalog.close()
+
+        second = Engine(paths, FakeEmbedder(), FakeOcr(), fast_settings, watch=False)
+        sync(second)
+        assert second.token_limit == 2000
+        assert second.vectors.count(TEXT) == count
+        assert second.embedder.document_calls == 0
+
+    def test_it_changes_how_much_of_a_scanned_pdf_gets_read(self, engine, library) -> None:
+        import pymupdf
+
+        engine.indexer._ocr.text = "scanned exam question about graphs " * 40
+        stamp = library.parent / "stamp.png"
+        textured((300, 300), (120, 120, 120)).save(stamp)
+        doc = pymupdf.open()
+        for _ in range(10):
+            doc.new_page().insert_image(pymupdf.Rect(0, 0, 300, 300), filename=str(stamp))
+        doc.save(library / "scan.pdf")
+        doc.close()
+        sync(engine)
+        assert engine.indexer._ocr.calls == 2
+        engine.set_token_limit(1000)
+        sync(engine)
+        assert engine.indexer._ocr.calls == 2 + 3  # 4,000 characters now takes three pages.
+
+
+class TestReindex:
+    def test_every_file_is_redone_and_stays_searchable_meanwhile(self, engine, library) -> None:
+        (library / "notes.txt").write_text("We discussed system design and ownership.")
+        textured((640, 480), (220, 20, 20)).save(library / "photo.png")
+        sync(engine)
+        documents, images = engine.embedder.document_calls, engine.embedder.image_calls
+
+        engine.reindex()
+        assert names(engine.search("system design"))[0] == "notes.txt"
+        assert engine.embedder.document_calls == documents
+
+        sync(engine)
+        assert engine.embedder.document_calls == documents + 1
+        assert engine.embedder.image_calls == images + 1
+        assert engine.vectors.count(TEXT) == 1 and engine.vectors.count(IMAGE) == 1
+        assert engine.catalog.get_file(str(library / "notes.txt")).status == "indexed"
+
+    def test_it_keeps_index_anyway_choices(self, engine, library) -> None:
+        path = library / "tiny.png"
+        textured((100, 100), (220, 10, 10)).save(path)
+        sync(engine)
+        engine.index_anyway(str(path))
+        drain(engine)
+        engine.reindex()
+        sync(engine)
+        assert engine.catalog.get_file(str(path)).index_level == "full"
+
+    def test_it_redoes_files_despite_the_cooldown(self, paths, library) -> None:
+        from lodestone.config import Settings
+
+        settings = Settings(debounce_seconds=0, delete_delay_seconds=0, reindex_cooldown_seconds=600)
+        engine = Engine(paths, FakeEmbedder(), FakeOcr(), settings, watch=False)
+        engine.catalog.add_folder(str(library))
+        (library / "notes.txt").write_text("We discussed system design and ownership.")
+        sync(engine)
+        calls = engine.embedder.document_calls
+        engine.reindex()
+        sync(engine)
+        assert engine.embedder.document_calls == calls + 1
+
+    def test_an_unplugged_drive_keeps_its_entries(self, engine, library, tmp_path) -> None:
+        (library / "notes.txt").write_text("We discussed system design and ownership.")
+        sync(engine)
+        away = tmp_path / "unplugged"
+        library.rename(away)
+        engine.reindex()
+        sync(engine)
+        assert engine.catalog.get_file(str(library / "notes.txt")) is not None
+        away.rename(library)
+        sync(engine)
+        assert engine.catalog.get_file(str(library / "notes.txt")).status == "indexed"
+
+    def test_a_crash_midway_picks_up_again(self, paths, library, fast_settings) -> None:
+        (library / "notes.txt").write_text("We discussed system design and ownership.")
+        first = Engine(paths, FakeEmbedder(), FakeOcr(), fast_settings, watch=False)
+        first.catalog.add_folder(str(library))
+        sync(first)
+        first.reindex()
+        first.catalog.close()
+
+        second = Engine(paths, FakeEmbedder(), FakeOcr(), fast_settings, watch=False)
+        sync(second)
+        assert second.embedder.document_calls == 1
+
+
+class TestDeleteIndex:
+    def test_everything_indexed_goes_but_folders_and_settings_stay(self, engine, library) -> None:
+        (library / "notes.txt").write_text("We discussed system design and ownership.")
+        textured((640, 480), (220, 20, 20)).save(library / "photo.png")
+        sync(engine)
+        engine.add_exclude(str(library / "skip"))
+        engine.add_custom_exts([".py"])
+        engine.set_token_limit(1000)
+        sync(engine)
+
+        engine.delete_index()
+
+        assert engine.catalog.counts()["total"] == 0
+        assert engine.vectors.count(TEXT) == 0 and engine.vectors.count(IMAGE) == 0
+        assert engine.catalog.queue_size() == 0
+        assert engine.search("system design") == []
+        assert engine.catalog.keyword_search("system design", 5) == []
+        assert [f.path for f in engine.folders()] == [str(library)]
+        assert engine.excludes() == [str(library / "skip")]
+        assert engine.custom_exts() == [".py"]
+        assert engine.token_limit == 1000
+        assert (library / "notes.txt").exists() and (library / "photo.png").exists()
+
+    def test_it_gives_the_disk_space_back(self, engine, library) -> None:
+        for i in range(40):
+            (library / f"{i}.txt").write_text(f"file {i} " + "some repeated words " * 2000)
+        sync(engine)
+        before = _size_of(engine.paths.root)
+        engine.delete_index()
+        assert _size_of(engine.paths.root) < before / 2
+
+    def test_it_stays_paused_until_asked_even_after_a_restart(self, paths, library, fast_settings) -> None:
+        (library / "notes.txt").write_text("We discussed system design and ownership.")
+        first = Engine(paths, FakeEmbedder(), FakeOcr(), fast_settings, watch=False)
+        first.catalog.add_folder(str(library))
+        sync(first)
+        first.delete_index()
+        assert first.paused
+        first.catalog.close()
+
+        second = Engine(paths, FakeEmbedder(), FakeOcr(), fast_settings, watch=False)
+        assert second.paused
+        assert second.status().state == "Paused"
+        second.start()
+        try:
+            assert _eventually(lambda: second.catalog.queue_size() == 1, 10)
+            time.sleep(0.8)  # Long enough for the worker to have started, if it wrongly could.
+            assert second.catalog.counts()["total"] == 0
+
+            second.set_paused(False)
+            assert _eventually(lambda: second.status().indexed == 1, 15)
+            assert names(second.search("system design"))[0] == "notes.txt"
+        finally:
+            second.stop()
+
+    def test_new_vectors_work_after_a_vector_index_was_dropped(self, paths, library) -> None:
+        from lodestone.config import Settings
+
+        settings = Settings(debounce_seconds=0, delete_delay_seconds=0, index_min_vectors=256)
+        engine = Engine(paths, FakeEmbedder(), FakeOcr(), settings, watch=False)
+        engine.catalog.add_folder(str(library))
+        for i in range(300):
+            (library / f"{i}.txt").write_text(f"note number word{i} about something")
+        sync(engine)
+        assert engine.vectors.has_index(TEXT)
+
+        engine.delete_index()
+        assert not engine.vectors.has_index(TEXT)
+        sync(engine)
+        assert engine.vectors.count(TEXT) == 300
+        assert names(engine.search("word7"))[0] == "7.txt"
+
+
+class TestChangesDuringABatch:
+    """The worker may be mid-file when these arrive. What it was doing must not land afterwards."""
+
+    @pytest.fixture
+    def blocked(self, paths, library, fast_settings):
+        embedder = _BlockingEmbedder()
+        engine = Engine(paths, embedder, FakeOcr(), fast_settings, watch=False)
+        engine.catalog.add_folder(str(library))
+        (library / "notes.txt").write_text("We discussed system design and ownership.")
+        engine.start()
+        assert embedder.entered.wait(15)
+        yield engine, embedder
+        embedder.release.set()
+        engine.stop()
+
+    def test_delete_waits_and_leaves_nothing_behind(self, blocked) -> None:
+        engine, embedder = blocked
+        worker = threading.Thread(target=engine.delete_index)
+        worker.start()
+        worker.join(0.3)
+        assert worker.is_alive()
+        embedder.release.set()
+        worker.join(15)
+        assert not worker.is_alive()
+        assert engine.vectors.count(TEXT) == 0
+        assert engine.catalog.counts()["indexed"] == 0
+
+    def test_token_limit_redoes_a_file_caught_midway(self, blocked, library) -> None:
+        engine, embedder = blocked
+        worker = threading.Thread(target=engine.set_token_limit, args=(0,))
+        worker.start()
+        worker.join(0.3)
+        assert worker.is_alive()
+        embedder.release.set()
+        worker.join(15)
+        assert not worker.is_alive()
+        # It was being embedded under the old limit. At a limit of 0 it must end with no vectors.
+        assert _eventually(
+            lambda: engine.catalog.get_file(str(library / "notes.txt")).status == "indexed"
+            and engine.catalog.queue_size() == 0
+            and engine.vectors.count(TEXT) == 0,
+            15,
+        )
+
+
+class _BlockingEmbedder(FakeEmbedder):
+    """Holds the first batch open, so a test can act while the worker is mid-file."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def encode_documents(self, texts: list[str]):
+        self.entered.set()
+        self.release.wait(15)
+        return super().encode_documents(texts)
+
+
+def _size_of(folder: Path) -> int:
+    return sum(path.stat().st_size for path in folder.rglob("*") if path.is_file())
 
 
 class TestLiveWatching:

@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QFileDialog,
     QFrame,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -31,6 +32,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QPushButton,
+    QSlider,
     QSystemTrayIcon,
     QTabWidget,
     QTreeWidget,
@@ -39,8 +41,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..config import data_dir
+from ..config import SETTINGS, TOKEN_LIMIT_MAX, TOKEN_LIMIT_STEP, data_dir
 from ..engine import Engine
+from ..scanner import parse_exts
 from ..search import ALL, DOCUMENTS, IMAGES, SearchResult
 
 log = logging.getLogger(__name__)
@@ -494,13 +497,14 @@ class SettingsDialog(QDialog):
         tabs = QTabWidget()
         tabs.addTab(self._folders_tab(), "Folders")
         tabs.addTab(self._review_tab(), "Name-only images")
+        tabs.addTab(self._index_tab(), "Index")
 
         self.autostart = QCheckBox("Start LodeStone when I sign in")
         self.autostart.setChecked(_autostart_enabled())
         self.autostart.toggled.connect(_set_autostart)
         self.pause = QCheckBox("Pause indexing")
         self.pause.setChecked(engine.paused)
-        self.pause.toggled.connect(engine.set_paused)
+        self.pause.toggled.connect(lambda checked: _run(self.pool, lambda: engine.set_paused(checked)))
         self.use_gpu = QCheckBox("Use GPU if available")
         self.use_gpu.setChecked(engine.use_gpu)
         self.use_gpu.setToolTip(
@@ -534,6 +538,11 @@ class SettingsDialog(QDialog):
     def hideEvent(self, event) -> None:
         self.timer.stop()
         super().hideEvent(event)
+
+    def keyPressEvent(self, event) -> None:
+        # Enter in the file type box would otherwise also press the dialog's default button.
+        if event.key() not in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            super().keyPressEvent(event)
 
     # ---- folders tab ---------------------------------------------------------------------------
 
@@ -590,6 +599,10 @@ class SettingsDialog(QDialog):
         self.exclude_list.clear()
         self.exclude_list.addItems(self.engine.excludes())
         self.pause.setChecked(self.engine.paused)
+        self.type_list.clear()
+        self.type_list.addItems(self.engine.custom_exts())
+        self.token_slider.setValue(self.engine.token_limit // TOKEN_LIMIT_STEP)
+        self._token_moved()
         self.refresh_counts()
         self.refresh_review()
 
@@ -617,7 +630,7 @@ class SettingsDialog(QDialog):
             elif not os.path.isdir(path):
                 state = "Not found"
             elif queued:
-                state = f"Indexing, {queued:,} to go"
+                state = f"{'Paused' if self.engine.paused else 'Indexing'}, {queued:,} to go"
             else:
                 state = "Up to date"
             item.setText(2, state)
@@ -738,6 +751,176 @@ class SettingsDialog(QDialog):
             self.engine.index_anyway(item.data(0, Qt.ItemDataRole.UserRole))
             index = self.review_tree.indexOfTopLevelItem(item)
             self.review_tree.takeTopLevelItem(index)
+
+    # ---- index tab -----------------------------------------------------------------------------
+
+    def _index_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.addWidget(self._types_group(), 1)
+        layout.addWidget(self._token_group())
+        layout.addWidget(self._manage_group())
+        return tab
+
+    def _types_group(self) -> QGroupBox:
+        explain = QLabel(
+            "Search inside more file types. They need to be plain text, like .xml or .py, or images "
+            "that OCR can read, like .jfif. Anything else, like .zip or .mp4, can only be found by "
+            "its filename."
+        )
+        explain.setWordWrap(True)
+        self.type_list = QListWidget()
+        self.type_input = QLineEdit()
+        self.type_input.setPlaceholderText(".xml, .py")
+        self.type_input.setAccessibleName("File types to add")
+        self.type_input.returnPressed.connect(self._add_types)
+        add = QPushButton("+ Add")
+        add.clicked.connect(self._add_types)
+        remove = QPushButton("- Remove")
+        remove.clicked.connect(self._remove_type)
+        row = QHBoxLayout()
+        row.addWidget(self.type_input, 1)
+        row.addWidget(add)
+        row.addWidget(remove)
+
+        group = QGroupBox("Extra file types")
+        layout = QVBoxLayout(group)
+        layout.addWidget(explain)
+        layout.addWidget(self.type_list, 1)
+        layout.addLayout(row)
+        return group
+
+    def _token_group(self) -> QGroupBox:
+        self.token_slider = QSlider(Qt.Orientation.Horizontal)
+        self.token_slider.setRange(0, TOKEN_LIMIT_MAX // TOKEN_LIMIT_STEP)
+        self.token_slider.setPageStep(5)
+        self.token_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+        self.token_slider.setTickInterval(5)
+        self.token_slider.setAccessibleName("Token limit")
+        self.token_slider.valueChanged.connect(self._token_moved)
+        self.token_value = QLabel()
+        self.token_value.setMinimumWidth(80)
+        self.token_apply = QPushButton("Apply")
+        self.token_apply.clicked.connect(self._apply_token_limit)
+        row = QHBoxLayout()
+        row.addWidget(self.token_slider, 1)
+        row.addWidget(self.token_value)
+        row.addWidget(self.token_apply)
+        hint = QLabel(
+            "How much of each file is embedded, for finding it by meaning. The default is "
+            f"{SETTINGS.embed_token_limit}. Higher finds more in long files, but indexing gets slower "
+            "and the index larger. At 0, documents are only found by exact words and filename, "
+            "and scanned PDFs aren't read."
+        )
+        hint.setWordWrap(True)
+        hint.setObjectName("statusText")
+
+        group = QGroupBox("Token limit")
+        layout = QVBoxLayout(group)
+        layout.addLayout(row)
+        layout.addWidget(hint)
+        return group
+
+    def _manage_group(self) -> QGroupBox:
+        self.reindex_button = QPushButton("Reindex")
+        self.reindex_button.clicked.connect(self._reindex)
+        self.delete_button = QPushButton("Delete index")
+        self.delete_button.clicked.connect(self._delete_index)
+        self.index_note = QLabel()
+        self.index_note.setObjectName("statusText")
+        self.index_note.setWordWrap(True)
+        row = QHBoxLayout()
+        row.addWidget(self.reindex_button)
+        row.addWidget(self.delete_button)
+        row.addWidget(self.index_note, 1)
+
+        group = QGroupBox("Whole index")
+        layout = QVBoxLayout(group)
+        layout.addLayout(row)
+        return group
+
+    def _add_types(self) -> None:
+        try:
+            exts = parse_exts(self.type_input.text())
+        except ValueError as error:
+            QMessageBox.warning(self, "Couldn't add that file type", str(error))
+            return
+        if exts:
+            self.type_input.clear()
+            _run(self.pool, lambda: self.engine.add_custom_exts(exts), lambda _: self.refresh())
+
+    def _remove_type(self) -> None:
+        item = self.type_list.currentItem()
+        if item:
+            ext = item.text()
+            _run(self.pool, lambda: self.engine.remove_custom_ext(ext), lambda _: self.refresh())
+
+    def _token_moved(self) -> None:
+        limit = self.token_slider.value() * TOKEN_LIMIT_STEP
+        self.token_value.setText(f"{limit:,} tokens")
+        self.token_apply.setEnabled(limit != self.engine.token_limit)
+
+    def _paused_note(self) -> str:
+        return " Indexing is paused, so this starts when you turn it back on." if self.engine.paused else ""
+
+    def _apply_token_limit(self) -> None:
+        limit = self.token_slider.value() * TOKEN_LIMIT_STEP
+        answer = QMessageBox.question(
+            self,
+            "Reindex with the new limit?",
+            f"LodeStone will read and embed your documents again using {limit:,} tokens, which could "
+            "take a while. Images are only redone if they have text in them. Search keeps working "
+            f"in the meantime.{self._paused_note()}",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            self.token_slider.setValue(self.engine.token_limit // TOKEN_LIMIT_STEP)
+            return
+        self._index_job(lambda: self.engine.set_token_limit(limit), f"Reindexing with {limit:,} tokens.")
+
+    def _reindex(self) -> None:
+        answer = QMessageBox.question(
+            self,
+            "Reindex everything?",
+            "LodeStone will read and embed all your files again, which could take many hours. "
+            f"Search keeps working in the meantime.{self._paused_note()}",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer == QMessageBox.StandardButton.Yes:
+            self._index_job(self.engine.reindex, "Reindexing.")
+
+    def _delete_index(self) -> None:
+        answer = QMessageBox.warning(
+            self,
+            "Delete the whole index?",
+            "LodeStone will forget everything it has indexed and free up the disk space. Your files "
+            "won't be touched, and your folders and settings stay.\n\nSearch won't find anything "
+            "until it's rebuilt. Indexing gets paused, so turn off Pause indexing when you want that.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer == QMessageBox.StandardButton.Yes:
+            self._index_job(self.engine.delete_index, "Index deleted. Indexing is paused.")
+
+    def _index_job(self, work: Callable[[], None], message: str) -> None:
+        """These wait for the current indexing batch to finish, so they can take a moment."""
+        self.reindex_button.setEnabled(False)
+        self.delete_button.setEnabled(False)
+        self.token_apply.setEnabled(False)
+        self.index_note.setText("Working on it...")
+        _run(self.pool, work, lambda result: self._index_job_done(result, message))
+
+    def _index_job_done(self, result: object, message: str) -> None:
+        self.reindex_button.setEnabled(True)
+        self.delete_button.setEnabled(True)
+        if isinstance(result, Exception):
+            self.index_note.setText("")
+            QMessageBox.warning(self, "That didn't work", str(result))
+        else:
+            self.index_note.setText(message)
+        self.refresh()
 
 
 def _autostart_enabled() -> bool:

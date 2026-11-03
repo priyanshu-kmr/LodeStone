@@ -6,8 +6,9 @@ import logging
 import os
 import threading
 import time
-from dataclasses import dataclass
-from typing import Callable
+from contextlib import contextmanager
+from dataclasses import dataclass, replace
+from typing import Callable, Iterator
 
 from .catalog import PRIORITY_MISSING, PRIORITY_SCAN, Catalog, DatasetPrompt, WatchedFolder
 from .config import (
@@ -51,8 +52,11 @@ class Engine:
         watch: bool = True,
     ) -> None:
         self.paths = paths or get_paths()
-        self.settings = settings
         self.catalog = Catalog(self.paths.catalog)
+        saved_limit = self.catalog.get_meta("user_token_limit")
+        if saved_limit is not None:
+            settings = replace(settings, embed_token_limit=int(saved_limit))
+        self.settings = settings
         self.vectors = VectorStore(self.paths.vectors, settings=settings)
         if embedder is None:
             from .embedder import GemmaEmbedder
@@ -74,7 +78,11 @@ class Engine:
         self._scan_wanted = threading.Event()
         self._scanning = threading.Event()
         self._paused = threading.Event()
+        if self.catalog.get_meta("paused") == "1":
+            self._paused.set()
         self._admin_lock = threading.Lock()
+        self._batch_lock = threading.Lock()
+        self._hold_worker = threading.Event()
         self._threads: list[threading.Thread] = []
         self.watcher = (
             Watcher(self.catalog, self.request_scan, self._wake.set, settings) if watch else None
@@ -133,9 +141,10 @@ class Engine:
     def _worker_loop(self) -> None:
         while not self._stop.is_set():
             handled = 0
-            if not self._paused.is_set():
+            if not self._paused.is_set() and not self._hold_worker.is_set():
                 try:
-                    handled = self.indexer.run_batch()
+                    with self._batch_lock:
+                        handled = self.indexer.run_batch()
                     if not handled:
                         with self._admin_lock:
                             self.indexer.idle()
@@ -164,6 +173,18 @@ class Engine:
                 self._wake.set()
                 self._notify()
 
+    @contextmanager
+    def _worker_held(self) -> Iterator[None]:
+        """Let the worker finish its batch and keep it out, so it can't write stale results after."""
+        with self._admin_lock:
+            self._hold_worker.set()
+            try:
+                with self._batch_lock:
+                    yield
+            finally:
+                self._hold_worker.clear()
+                self._wake.set()
+
     def request_scan(self) -> None:
         self._scan_wanted.set()
 
@@ -182,12 +203,13 @@ class Engine:
         known: dict[str, tuple[int, int, str]] = {}
         blocked: list[str] = [p.path for p in decisions if p.decision == "pending"]
         excludes = catalog.excludes() + disabled
+        extra_exts = catalog.custom_exts()
 
         for root in enabled:
             if not os.path.isdir(root):
                 # An unplugged drive must not look like every file was deleted.
                 continue
-            result = scan_root(root, excludes, self.settings, self._stop.is_set)
+            result = scan_root(root, excludes, self.settings, self._stop.is_set, extra_exts)
             if self._stop.is_set():
                 return
             for candidate in result.candidates:
@@ -264,7 +286,7 @@ class Engine:
         return self.catalog.excludes()
 
     def estimate(self, path: str) -> FolderEstimate:
-        return estimate_folder(path, self.catalog.excludes())
+        return estimate_folder(path, self.catalog.excludes(), self.catalog.custom_exts())
 
     def add_folder(self, path: str) -> None:
         self.catalog.add_folder(path)
@@ -306,6 +328,50 @@ class Engine:
         self.request_scan()
         self._wake.set()
         self._notify()
+
+    # ---- file types, token limit and the whole index -------------------------------------------
+
+    def custom_exts(self) -> list[str]:
+        return sorted(self.catalog.custom_exts())
+
+    def add_custom_exts(self, exts: list[str]) -> None:
+        self.catalog.set_custom_exts(self.catalog.custom_exts() | set(exts))
+        self._settings_changed()
+
+    def remove_custom_ext(self, ext: str) -> None:
+        """The rescan queues these files as missing, and the worker then forgets them."""
+        self.catalog.set_custom_exts(self.catalog.custom_exts() - {ext})
+        self._settings_changed()
+
+    @property
+    def token_limit(self) -> int:
+        return self.settings.embed_token_limit
+
+    def set_token_limit(self, limit: int) -> None:
+        """Only text uses the limit, so images without any text keep their slow-to-make vectors."""
+        with self._worker_held():
+            self.catalog.set_meta("user_token_limit", str(limit))
+            self.settings = replace(self.settings, embed_token_limit=limit)
+            self.indexer.set_settings(self.settings)
+            self.catalog.mark_for_reindex(text_only=True)
+        self._settings_changed()
+
+    def reindex(self) -> None:
+        """Read and embed every file again. Each stays searchable until its turn comes."""
+        with self._worker_held():
+            self.catalog.mark_for_reindex()
+        self._settings_changed()
+
+    def delete_index(self) -> None:
+        """Forget every file and free the disk space. The actual files are never touched.
+
+        Indexing stays paused afterwards, or the next scan would rebuild it all straight away.
+        """
+        self.set_paused(True)
+        with self._worker_held():
+            self.vectors.clear()
+            self.catalog.clear_index()
+        self._settings_changed()
 
     # ---- review: datasets and name-only images -----------------------------------------------
 
@@ -354,11 +420,13 @@ class Engine:
         return self._paused.is_set()
 
     def set_paused(self, paused: bool) -> None:
+        """Remembered between runs, so a deleted index isn't rebuilt by simply restarting."""
         if paused:
             self._paused.set()
         else:
             self._paused.clear()
             self._wake.set()
+        self.catalog.set_meta("paused", "1" if paused else "0")
         self._notify()
 
     def status(self) -> Status:

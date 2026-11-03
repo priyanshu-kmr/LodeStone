@@ -60,6 +60,7 @@ class Watcher:
         self._handler = _Handler(self)
         self._roots: list[str] = []
         self._excludes: list[str] = []
+        self._extra_exts: frozenset[str] = frozenset()
 
     def start(self) -> None:
         self._observer = Observer()
@@ -78,6 +79,7 @@ class Watcher:
         self._roots = folders
         pending = [p.path for p in self._catalog.dataset_prompts("pending")]
         self._excludes = self._catalog.excludes() + pending
+        self._extra_exts = self._catalog.custom_exts()
         if self._observer is None:
             return
         for path in list(self._watches):
@@ -95,7 +97,7 @@ class Watcher:
 
     def file_changed(self, path: str) -> None:
         name = os.path.basename(path)
-        if kind_of(name) is None or is_temp_file(name):
+        if kind_of(name, self._extra_exts) is None or is_temp_file(name):
             return
         if path_allowed(path, self._roots, self._excludes):
             # Each new event restarts the wait, so half-copied files are left alone.
