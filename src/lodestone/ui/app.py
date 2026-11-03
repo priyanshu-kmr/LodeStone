@@ -292,6 +292,11 @@ class SearchWindow(QMainWindow):
         self.results.itemActivated.connect(self._open_item)
         self.results.hide()
 
+        self.more_button = QPushButton("Show more results")
+        self.more_button.clicked.connect(self._show_more)
+        self.more_button.hide()
+        self._shown_search: tuple[str, str] = ("", ALL)
+
         self.empty_title = QLabel("Search your files by describing them")
         self.empty_title.setObjectName("emptyTitle")
         self.empty_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -318,6 +323,7 @@ class SearchWindow(QMainWindow):
         layout.addLayout(filter_row)
         layout.addWidget(self.prompt_banner)
         layout.addWidget(self.results, 1)
+        layout.addWidget(self.more_button)
         layout.addWidget(self.empty, 1)
         layout.addWidget(self.status_text)
         self.setCentralWidget(central)
@@ -364,20 +370,24 @@ class SearchWindow(QMainWindow):
             return
         self._request += 1
         request, mode = self._request, self._mode()
+        top_k = self.engine.settings.default_top_k
+        self._shown_search = (query, mode)
+        self.more_button.setEnabled(False)  # It would add to the results about to be replaced.
         if not self.engine.search_model_loaded:
             self._waiting_for_model = True
             self.status_text.setText("Loading the search model, which takes a few seconds...")
         _run(
             self.pool,
-            lambda: self.engine.search(query, mode=mode),
-            lambda results: self._show_results(request, query, results),
+            lambda: self.engine.search(query, top_k, mode),
+            lambda results: self._show_results(request, query, top_k, results),
         )
 
-    def _show_results(self, request: int, query: str, results) -> None:
+    def _show_results(self, request: int, query: str, top_k: int, results) -> None:
         if request != self._request:
             return  # A newer search has started, so this answer is out of date.
         self._waiting_for_model = False
         self.results.clear()
+        self.more_button.setEnabled(True)
         if isinstance(results, Exception):
             self._show_empty("Search failed", str(results))
             return
@@ -386,6 +396,12 @@ class SearchWindow(QMainWindow):
             return
         self.empty.hide()
         self.results.show()
+        self._add_results(request, results)
+        self.results.setCurrentRow(0)
+        # A full page means there may be more. Fewer means that was everything.
+        self.more_button.setVisible(len(results) >= top_k)
+
+    def _add_results(self, request: int, results) -> None:
         for result in results:
             item = QListWidgetItem()
             item.setData(Qt.ItemDataRole.UserRole, result.path)
@@ -395,7 +411,34 @@ class SearchWindow(QMainWindow):
             self.results.setItemWidget(item, row)
             if result.kind == "image":
                 self._load_thumbnail(request, result.path, row)
-        self.results.setCurrentRow(0)
+
+    def _show_more(self) -> None:
+        request = self._request  # The same search, so thumbnails still loading aren't thrown away.
+        query, mode = self._shown_search
+        top_k = self.results.count() + self.engine.settings.default_top_k
+        self.more_button.setEnabled(False)
+        _run(
+            self.pool,
+            lambda: self.engine.search(query, top_k, mode),
+            lambda results: self._add_more_results(request, top_k, results),
+        )
+
+    def _add_more_results(self, request: int, top_k: int, results) -> None:
+        if request != self._request:
+            return
+        self.more_button.setEnabled(True)
+        if isinstance(results, Exception):
+            self.status_text.setText(f"Couldn't load more results: {results}")
+            return
+        # Searching deeper can reorder results slightly. Only add to the end, so nothing moves
+        # while it's being read.
+        shown = {self.results.item(i).data(Qt.ItemDataRole.UserRole) for i in range(self.results.count())}
+        new = [result for result in results if result.path not in shown]
+        first_new = self.results.count()
+        self._add_results(request, new)
+        if new:
+            self.results.setCurrentRow(first_new)
+        self.more_button.setVisible(bool(new) and len(results) >= top_k)
 
     def _load_thumbnail(self, request: int, path: str, row: ResultRow) -> None:
         def show(image) -> None:
@@ -406,6 +449,7 @@ class SearchWindow(QMainWindow):
 
     def _show_empty(self, title: str, body: str) -> None:
         self.results.hide()
+        self.more_button.hide()
         self.empty_title.setText(title)
         self.empty_body.setText(body)
         self.empty.show()

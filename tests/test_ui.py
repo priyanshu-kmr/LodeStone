@@ -139,6 +139,82 @@ def test_filter_buttons_change_the_results(qapp, engine, library) -> None:
     finish(window, qapp)
 
 
+def _many_notes(library, count: int) -> None:
+    for index in range(count):
+        (library / f"note_{index:03}.txt").write_text(f"apple pie recipe number {index}")
+
+
+def test_show_more_adds_results_without_moving_the_first_ones(qapp, engine, library) -> None:
+    _many_notes(library, 45)
+    drain(engine)
+    window = SearchWindow(engine)
+    window.show()
+    window.search_box.setText("apple pie")
+    assert wait_for(qapp, lambda: window.results.count() == 20)
+    assert window.more_button.isVisible()
+    paths = lambda: [window.results.item(i).data(256) for i in range(window.results.count())]  # noqa: E731
+    first_page = paths()
+
+    window.more_button.click()
+    assert wait_for(qapp, lambda: window.results.count() == 40)
+    assert paths()[:20] == first_page
+    assert len(set(paths())) == 40
+    assert window.results.currentRow() == 20  # On the first new result, ready to keep reading.
+    assert window.more_button.isVisible() and window.more_button.isEnabled()
+
+    window.more_button.click()
+    assert wait_for(qapp, lambda: window.results.count() == 45)
+    assert wait_for(qapp, lambda: not window.more_button.isVisible())  # That was all of them.
+    finish(window, qapp)
+
+
+def test_show_more_stays_hidden_when_everything_is_already_shown(qapp, engine, library) -> None:
+    _many_notes(library, 5)
+    drain(engine)
+    window = SearchWindow(engine)
+    window.show()
+    window.search_box.setText("apple pie")
+    assert wait_for(qapp, lambda: window.results.count() == 5)
+    assert not window.more_button.isVisible()
+    finish(window, qapp)
+
+
+def test_a_new_search_starts_again_from_the_first_page(qapp, engine, library) -> None:
+    _many_notes(library, 45)
+    drain(engine)
+    window = SearchWindow(engine)
+    window.show()
+    window.search_box.setText("apple pie")
+    assert wait_for(qapp, lambda: window.results.count() == 20)
+    window.more_button.click()
+    assert wait_for(qapp, lambda: window.results.count() == 40)
+
+    window.search_box.setText("recipe number")
+    assert wait_for(qapp, lambda: window.results.count() == 20)
+    window.search_box.setText("")
+    assert not window.more_button.isVisible()
+    finish(window, qapp)
+
+
+def test_show_more_ignores_an_answer_from_an_older_search(qapp, engine, library) -> None:
+    _many_notes(library, 45)
+    (library / "other.txt").write_text("a completely different banana")
+    drain(engine)
+    window = SearchWindow(engine)
+    window.show()
+    window.search_box.setText("apple pie")
+    assert wait_for(qapp, lambda: window.results.count() == 20)
+    window.more_button.click()
+    window.search_box.setText("banana")
+    window._search_now()  # Starts before the click's answer arrives, which must then be dropped.
+    assert wait_for(qapp, lambda: window.more_button.isEnabled() and window.results.count() > 0)
+    window.pool.waitForDone(3000)
+    wait_for(qapp, lambda: False, timeout=0.2)
+    assert window.results.item(0).data(256).endswith("other.txt")
+    assert window.results.count() <= 20
+    finish(window, qapp)
+
+
 def test_status_line_and_dataset_prompt(qapp, engine, library) -> None:
     (library / "a.txt").write_text("hello")
     drain(engine)
