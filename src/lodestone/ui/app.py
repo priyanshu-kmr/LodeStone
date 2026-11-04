@@ -42,11 +42,13 @@ from PySide6.QtWidgets import (
 )
 
 from ..config import (
+    DEFAULT_MODEL,
     MEDIA_SECONDS_MAX,
     MEDIA_SECONDS_STEP,
     SETTINGS,
     TOKEN_LIMIT_MAX,
     TOKEN_LIMIT_STEP,
+    EmbeddingModel,
     data_dir,
 )
 from ..engine import Engine
@@ -558,6 +560,7 @@ class SettingsDialog(QDialog):
         tabs.addTab(self._folders_tab(), "Folders")
         tabs.addTab(self._review_tab(), "Name-only images")
         tabs.addTab(self._index_tab(), "Index")
+        tabs.addTab(self._advanced_tab(), "Advanced")
 
         self.autostart = QCheckBox("Start LodeStone when I sign in")
         self.autostart.setChecked(_autostart_enabled())
@@ -565,21 +568,12 @@ class SettingsDialog(QDialog):
         self.pause = QCheckBox("Pause indexing")
         self.pause.setChecked(engine.paused)
         self.pause.toggled.connect(lambda checked: _run(self.pool, lambda: engine.set_paused(checked)))
-        self.use_gpu = QCheckBox("Use GPU if available")
-        self.use_gpu.setChecked(engine.use_gpu)
-        self.use_gpu.setToolTip(
-            "Faster indexing, needs 3-4GB vram"
-        )
-        self.use_gpu.toggled.connect(
-            lambda checked: _run(self.pool, lambda: engine.set_use_gpu(checked))
-        )
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         buttons.rejected.connect(self.close)
 
         footer = QHBoxLayout()
         footer.addWidget(self.autostart)
         footer.addWidget(self.pause)
-        footer.addWidget(self.use_gpu)
         footer.addStretch(1)
         footer.addWidget(buttons)
 
@@ -666,6 +660,8 @@ class SettingsDialog(QDialog):
         self.video_slider.setValue(self.engine.video_seconds // MEDIA_SECONDS_STEP)
         self.audio_slider.setValue(self.engine.audio_seconds // MEDIA_SECONDS_STEP)
         self._media_moved()
+        if self.model_input.isEnabled():  # Otherwise a model is being tested, which can take minutes.
+            self._show_model()
         self.refresh_counts()
         self.refresh_review()
 
@@ -913,8 +909,7 @@ class SettingsDialog(QDialog):
         )
         hint = QLabel(
             "How much of each file to read for semantic search, from the start. Longer durations find "
-            "more but slow indexing. The audio duration also applies to the sound in videos. At 0s, "
-            "that part isn't searched."
+            "more but slow indexing."
         )
         hint.setWordWrap(True)
         hint.setObjectName("statusText")
@@ -1067,6 +1062,172 @@ class SettingsDialog(QDialog):
         else:
             self.index_note.setText(message)
         self.refresh()
+
+    # ---- advanced tab --------------------------------------------------------------------------
+
+    def _advanced_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.addWidget(self._model_group())
+        layout.addWidget(self._gpu_group())
+        layout.addWidget(self._unload_group())
+        layout.addStretch(1)
+        return tab
+
+    def _option(self, text: str, checked: bool, apply: Callable[[bool], None]) -> QCheckBox:
+        box = QCheckBox(text)
+        box.setChecked(checked)
+        box.toggled.connect(lambda value: _run(self.pool, lambda: apply(value)))
+        return box
+
+    def _options_group(self, title: str, boxes: list[QCheckBox], explanation: str) -> QGroupBox:
+        hint = QLabel(explanation)
+        hint.setWordWrap(True)
+        hint.setObjectName("statusText")
+        group = QGroupBox(title)
+        layout = QVBoxLayout(group)
+        for box in boxes:
+            layout.addWidget(box)
+        layout.addWidget(hint)
+        return group
+
+    def _gpu_group(self) -> QGroupBox:
+        engine = self.engine
+        self.gpu_indexing = self._option(
+            "Use GPU for the indexing model", engine.gpu_for_indexing, engine.set_gpu_for_indexing
+        )
+        self.gpu_search = self._option(
+            "Use GPU for the search model", engine.gpu_for_search, engine.set_gpu_for_search
+        )
+        return self._options_group(
+            "GPU",
+            [self.gpu_indexing, self.gpu_search],
+            "Indexing becomes significantly faster but needs upto 4 GB of VRAM"
+            )
+
+    def _unload_group(self) -> QGroupBox:
+        engine = self.engine
+        self.unload_index = self._option(
+            f"Unload the indexing model after {_idle_text(SETTINGS.vision_idle_unload_seconds)} idle",
+            engine.settings.unload_index_model,
+            engine.set_unload_index_model,
+        )
+        self.unload_search = self._option(
+            f"Unload the search model after {_idle_text(SETTINGS.search_idle_unload_seconds)} idle",
+            engine.settings.unload_search_model,
+            engine.set_unload_search_model,
+        )
+        return self._options_group(
+            "Automatic unloading",
+            [self.unload_index, self.unload_search],
+            "A model that stays loaded responds right away, but keeps using RAM, or VRAM on the GPU, "
+            "until LodeStone quits. Search can take a few seconds to load the model again.",
+        )
+
+    def _model_group(self) -> QGroupBox:
+        self.model_current = QLabel()
+        self.model_current.setWordWrap(True)
+        self.model_input = QLineEdit()
+        self.model_input.setPlaceholderText("sentence-transformers/all-MiniLM-L6-v2")
+        self.model_input.setAccessibleName("Hugging Face model ID")
+        self.model_input.textChanged.connect(self._model_edited)
+        self.model_input.returnPressed.connect(self._switch_to_typed_model)
+        self.model_switch = QPushButton("Switch")
+        self.model_switch.clicked.connect(self._switch_to_typed_model)
+        self.model_default = QPushButton("Use default")
+        self.model_default.clicked.connect(lambda: self._confirm_model(DEFAULT_MODEL))
+        row = QHBoxLayout()
+        row.addWidget(self.model_input, 1)
+        row.addWidget(self.model_switch)
+        row.addWidget(self.model_default)
+        hint = QLabel(
+            "Enter a Hugging Face sentence-transformers model. It's tested before switching, then "
+            "all files are reindexed. Unsupported file types are found by filename and text only."
+        )
+        hint.setWordWrap(True)
+        hint.setObjectName("statusText")
+        self.model_note = QLabel()
+        self.model_note.setObjectName("statusText")
+        self.model_note.setWordWrap(True)
+
+        group = QGroupBox("Embedding model")
+        layout = QVBoxLayout(group)
+        layout.addWidget(self.model_current)
+        layout.addLayout(row)
+        layout.addWidget(hint)
+        layout.addWidget(self.model_note)
+        return group
+
+    def _show_model(self) -> None:
+        model = self.engine.embedding_model
+        self.model_current.setText(f"Current model: {_describe_model(model)}")
+        self.model_input.setText(model.id)
+        self.model_default.setEnabled(model.id != DEFAULT_MODEL.id)
+        self._model_edited()
+
+    def _model_edited(self) -> None:
+        typed = self.model_input.text().strip()
+        self.model_switch.setEnabled(bool(typed) and typed != self.engine.embedding_model.id)
+
+    def _switch_to_typed_model(self) -> None:
+        typed = self.model_input.text().strip()
+        if not typed or typed == self.engine.embedding_model.id:
+            return
+        if typed == DEFAULT_MODEL.id:
+            self._confirm_model(DEFAULT_MODEL)
+            return
+        self._set_model_busy(f"Downloading and testing {typed}, which can take several minutes...")
+        _run(self.pool, lambda: self.engine.inspect_model(typed), self._confirm_model)
+
+    def _set_model_busy(self, message: str) -> None:
+        self.model_input.setEnabled(False)
+        self.model_switch.setEnabled(False)
+        self.model_default.setEnabled(False)
+        self.model_note.setText(message)
+
+    def _model_job_done(self, message: str) -> None:
+        self.model_input.setEnabled(True)
+        self.model_note.setText(message)
+        self._show_model()
+
+    def _confirm_model(self, result: EmbeddingModel | Exception) -> None:
+        if isinstance(result, Exception):
+            self._model_job_done("")
+            QMessageBox.warning(self, "Couldn't use that model", str(result))
+            return
+        answer = QMessageBox.question(
+            self,
+            "Switch model and reindex?",
+            f"Switch to {_describe_model(result)}\n\nLodeStone will delete the current embeddings and "
+            "embed all your files again, which could take many hours. Until a file's turn comes, it "
+            f"can only be found by its filename and exact words.{self._paused_note()}",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            self._model_job_done("")
+            return
+        self._set_model_busy("Working on it...")
+        _run(self.pool, lambda: self.engine.set_embedding_model(result), lambda done: self._model_switched(result, done))
+
+    def _model_switched(self, model: EmbeddingModel, result: object) -> None:
+        if isinstance(result, Exception):
+            self._model_job_done("")
+            QMessageBox.warning(self, "That didn't work", str(result))
+        else:
+            self._model_job_done(f"Reindexing with {model.id}.")
+
+
+def _idle_text(seconds: float) -> str:
+    minutes = round(seconds / 60)
+    return f"{minutes} minute" if minutes == 1 else f"{minutes} minutes"
+
+
+def _describe_model(model: EmbeddingModel) -> str:
+    names = {"text": "text", "image": "images", "audio": "audio", "video": "video"}
+    kinds = [names[kind] for kind in names if kind in model.kinds]
+    read = ", ".join(kinds[:-1]) + f" and {kinds[-1]}" if len(kinds) > 1 else kinds[0]
+    return f"{model.id}, which reads {read} ({model.dim} dimensions)."
 
 
 def _autostart_enabled() -> bool:

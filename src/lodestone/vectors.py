@@ -47,12 +47,15 @@ class VectorStore:
         dim: int = EMBEDDING_DIM,
         settings: Settings = SETTINGS,
     ) -> None:
-        self._dim = dim
         self._settings = settings
         self._lock = threading.RLock()
         # Everything shares one process, but checking every read also keeps searches current
         # while the indexer is writing.
         self._db = lancedb.connect(str(path), read_consistency_interval=timedelta(0))
+        self._use_model(model_id, dim)
+
+    def _use_model(self, model_id: str, dim: int) -> None:
+        self._dim = dim
         self._schema = pa.schema(
             [
                 ("row_id", pa.int64()),
@@ -65,6 +68,12 @@ class VectorStore:
 
     def _open(self, name: str):
         return self._db.create_table(name, schema=self._schema, exist_ok=True)
+
+    def switch_model(self, model_id: str, dim: int) -> None:
+        """Start empty for a new model. Old tables would go stale, because reindexing changes ids."""
+        with self._lock:
+            self._db.drop_all_tables()
+            self._use_model(model_id, dim)
 
     def clear(self) -> None:
         """Drop the tables rather than deleting rows, so the disk space comes back right away."""

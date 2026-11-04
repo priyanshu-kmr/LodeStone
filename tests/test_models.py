@@ -13,7 +13,7 @@ import numpy as np
 import pytest
 from PIL import Image, ImageDraw, ImageFont
 
-from lodestone.config import MEDIA_SECONDS_MAX, Settings
+from lodestone.config import DEFAULT_MODEL, MEDIA_SECONDS_MAX, MODEL_ID, Settings
 
 pytestmark = pytest.mark.models
 
@@ -152,16 +152,20 @@ def test_gpu_and_cpu_vectors_match_when_a_gpu_is_available() -> None:
     text = "a query compared across devices"
     on_cpu = fresh.encode_query(text)
     image_cpu = fresh.encode_images([_photo(4)])[0]
-    fresh.set_use_gpu(True)
+    fresh.set_gpu_for_search(True)
     assert not fresh.search_model_loaded
+    assert {str(p.device) for p in fresh._index_model.parameters()} == {"cpu"}  # Its own choice.
+    fresh.set_gpu_for_indexing(True)
     on_gpu = fresh.encode_query(text)
     image_gpu = fresh.encode_images([_photo(4)])[0]
     assert {str(p.device) for p in fresh._query_model.parameters()} == {"cuda:0"}
     assert {p.dtype for p in fresh._query_model.parameters() if p.is_floating_point()} == {torch.bfloat16}
     assert float(np.dot(on_cpu, on_gpu)) > 0.999
     assert float(np.dot(image_cpu, image_gpu)) > 0.99
-    fresh.set_use_gpu(False)
-    assert fresh._query_model is None and fresh._index_model is None
+    fresh.set_gpu_for_search(False)
+    assert fresh._query_model is None and fresh._index_model is not None
+    fresh.set_gpu_for_indexing(False)
+    assert fresh._index_model is None
 
 
 def test_indexing_only_loads_the_audio_encoder_once_it_is_needed() -> None:
@@ -224,6 +228,35 @@ def test_text_finds_the_right_video_and_audio() -> None:
     }
     query = fresh.encode_query("beach holiday")
     assert float(np.dot(query, videos["beach"])) > float(np.dot(query, videos["invoice"]))
+
+
+def test_inspecting_finds_everything_the_default_model_can_read(embedder) -> None:
+    assert embedder.inspect_model(MODEL_ID) == DEFAULT_MODEL
+
+
+def test_a_text_only_model_can_be_inspected_and_used() -> None:
+    from lodestone.embedder import GemmaEmbedder
+
+    fresh = GemmaEmbedder()
+    model = fresh.inspect_model("sentence-transformers/all-MiniLM-L6-v2")
+    assert model.kinds == ("text",)
+    assert model.dim == 384
+    assert fresh.supports("image")  # Inspecting a model doesn't switch to it.
+
+    fresh.set_model(model)
+    assert not fresh.supports("image")
+    query = fresh.encode_query("a cat sitting on a mat")
+    documents = fresh.encode_documents(["A cat is resting on a rug.", "Quarterly tax filing deadlines."])
+    assert query.shape == (384,)
+    assert documents.shape == (2, 384)
+    assert float(np.dot(query, documents[0])) > float(np.dot(query, documents[1]))
+    long_text = "word " * 5000  # Past this model's own limit of 256 tokens.
+    assert np.isfinite(fresh.encode_documents([long_text])).all()
+
+
+def test_a_model_that_does_not_exist_gives_a_clear_error(embedder) -> None:
+    with pytest.raises(ValueError, match="Couldn't load"):
+        embedder.inspect_model("lodestone-tests/no-such-model")
 
 
 def test_ocr_reads_printed_text_and_ignores_blank_images() -> None:

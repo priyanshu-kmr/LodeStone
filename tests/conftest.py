@@ -13,7 +13,7 @@ import numpy as np
 import pytest
 from PIL import Image
 
-from lodestone.config import EMBEDDING_DIM, Paths, Settings
+from lodestone.config import EMBEDDING_DIM, EmbeddingModel, Paths, Settings
 from lodestone.ocr import OcrResult
 
 
@@ -45,10 +45,24 @@ class FakeEmbedder:
         self.video_lengths: list[int] = []
         self.audio_lengths: list[int] = []
         self.released = 0
-        self.gpu_settings: list[bool] = []
+        self.search_releases = 0
+        self.gpu_settings: list[tuple[str, bool]] = []
         self.warm_ups = 0
         self.search_model_loaded = True
         self.fail_on_size: tuple[int, int] | None = None
+        self.model = EmbeddingModel()
+        self.inspected: EmbeddingModel | Exception | None = None
+
+    def supports(self, kind: str) -> bool:
+        return kind in self.model.kinds
+
+    def set_model(self, model: EmbeddingModel) -> None:
+        self.model = model
+
+    def inspect_model(self, model_id: str) -> EmbeddingModel:
+        if isinstance(self.inspected, Exception):
+            raise self.inspected
+        return self.inspected or EmbeddingModel(id=model_id)
 
     def encode_query(self, text: str) -> np.ndarray:
         return word_vector(text)
@@ -75,10 +89,13 @@ class FakeEmbedder:
         self.released += 1
 
     def release_search_model_if_idle(self) -> None:
-        pass
+        self.search_releases += 1
 
-    def set_use_gpu(self, use_gpu: bool) -> None:
-        self.gpu_settings.append(use_gpu)
+    def set_gpu_for_search(self, use_gpu: bool) -> None:
+        self.gpu_settings.append(("search", use_gpu))
+
+    def set_gpu_for_indexing(self, use_gpu: bool) -> None:
+        self.gpu_settings.append(("indexing", use_gpu))
 
     def warm_up(self) -> None:
         self.warm_ups += 1

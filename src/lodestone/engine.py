@@ -12,7 +12,9 @@ from typing import Callable, Iterator
 
 from .catalog import PRIORITY_MISSING, PRIORITY_SCAN, Catalog, DatasetPrompt, WatchedFolder
 from .config import (
+    DEFAULT_MODEL,
     SETTINGS,
+    EmbeddingModel,
     Paths,
     Settings,
     default_folders,
@@ -60,12 +62,22 @@ class Engine:
             saved = self.catalog.get_meta(f"user_{field}")
             if saved is not None:
                 settings = replace(settings, **{field: int(saved)})
+        for field in ("unload_index_model", "unload_search_model"):
+            saved = self.catalog.get_meta(field)
+            if saved is not None:
+                settings = replace(settings, **{field: saved == "1"})
         self.settings = settings
-        self.vectors = VectorStore(self.paths.vectors, settings=settings)
+        saved_model = self.catalog.get_meta("embedding_model")
+        self.embedding_model = EmbeddingModel.from_json(saved_model) if saved_model else DEFAULT_MODEL
+        self.vectors = VectorStore(
+            self.paths.vectors, self.embedding_model.id, self.embedding_model.dim, settings
+        )
         if embedder is None:
             from .embedder import GemmaEmbedder
 
-            embedder = GemmaEmbedder(settings, use_gpu=self.catalog.get_meta("use_gpu") == "1")
+            embedder = GemmaEmbedder(
+                settings, self.gpu_for_search, self.gpu_for_indexing, self.embedding_model
+            )
         if ocr is None:
             from .ocr import Ocr
 
@@ -86,6 +98,7 @@ class Engine:
             self._paused.set()
         self._admin_lock = threading.Lock()
         self._batch_lock = threading.Lock()
+        self._search_lock = threading.Lock()
         self._hold_worker = threading.Event()
         self._threads: list[threading.Thread] = []
         self.watcher = (
@@ -145,13 +158,18 @@ class Engine:
     def _worker_loop(self) -> None:
         while not self._stop.is_set():
             handled = 0
-            if not self._paused.is_set() and not self._hold_worker.is_set():
+            if not self._hold_worker.is_set():
                 try:
-                    with self._batch_lock:
-                        handled = self.indexer.run_batch()
-                    if not handled:
+                    if self._paused.is_set():
+                        # Paused still has to let go of the models, or they stay loaded until unpaused.
                         with self._admin_lock:
-                            self.indexer.idle()
+                            self.indexer.free_unused()
+                    else:
+                        with self._batch_lock:
+                            handled = self.indexer.run_batch()
+                        if not handled:
+                            with self._admin_lock:
+                                self.indexer.idle()
                 except Exception:
                     log.exception("indexing batch failed")
                     self._stop.wait(1.0)
@@ -270,7 +288,9 @@ class Engine:
     # ---- search -----------------------------------------------------------------------------------
 
     def search(self, query: str, top_k: int | None = None, mode: str = ALL) -> list[SearchResult]:
-        results = self.searcher.search(query, top_k, mode)
+        # Holds off a model switch, because a query vector means nothing against another model's tables.
+        with self._search_lock:
+            results = self.searcher.search(query, top_k, mode)
         present = []
         for result in results:
             if os.path.exists(result.path):
@@ -400,6 +420,27 @@ class Engine:
             self.catalog.clear_index()
         self._settings_changed()
 
+    # ---- embedding model ----------------------------------------------------------------------
+
+    def inspect_model(self, model_id: str) -> EmbeddingModel:
+        """Download and try a model, without changing anything. This can take minutes."""
+        return self.embedder.inspect_model(model_id)
+
+    def set_embedding_model(self, model: EmbeddingModel) -> None:
+        """Replace the vectors and queue every file to be embedded again.
+
+        In this order so a crash at any point leaves a working index: until the model is saved,
+        the app restarts on the old model, and only has to reindex.
+        """
+        with self._worker_held():
+            self.catalog.mark_for_reindex()
+            with self._search_lock:
+                self.embedder.set_model(model)
+                self.vectors.switch_model(model.id, model.dim)
+                self.embedding_model = model
+            self.catalog.set_meta("embedding_model", model.to_json())
+        self._settings_changed()
+
     # ---- review: datasets and name-only images -----------------------------------------------
 
     def dataset_prompts(self) -> list[DatasetPrompt]:
@@ -424,14 +465,42 @@ class Engine:
 
     # ---- GPU ----------------------------------------------------------------------------------------
 
-    @property
-    def use_gpu(self) -> bool:
-        return self.catalog.get_meta("use_gpu") == "1"
+    def _gpu_choice(self, name: str) -> bool:
+        """Before there were two choices there was one, so that still counts until one is made."""
+        saved = self.catalog.get_meta(name)
+        return (saved if saved is not None else self.catalog.get_meta("use_gpu")) == "1"
 
-    def set_use_gpu(self, use_gpu: bool) -> None:
+    @property
+    def gpu_for_search(self) -> bool:
+        return self._gpu_choice("gpu_for_search")
+
+    @property
+    def gpu_for_indexing(self) -> bool:
+        return self._gpu_choice("gpu_for_indexing")
+
+    def set_gpu_for_search(self, use_gpu: bool) -> None:
         """Remembered between runs. Falls back to the CPU if there's no usable GPU."""
-        self.catalog.set_meta("use_gpu", "1" if use_gpu else "0")
-        self.embedder.set_use_gpu(use_gpu)
+        self.catalog.set_meta("gpu_for_search", "1" if use_gpu else "0")
+        self.embedder.set_gpu_for_search(use_gpu)
+
+    def set_gpu_for_indexing(self, use_gpu: bool) -> None:
+        """Remembered between runs. Falls back to the CPU if there's no usable GPU."""
+        self.catalog.set_meta("gpu_for_indexing", "1" if use_gpu else "0")
+        self.embedder.set_gpu_for_indexing(use_gpu)
+
+    # ---- unloading ----------------------------------------------------------------------------
+
+    def set_unload_index_model(self, unload: bool) -> None:
+        self._set_unload("unload_index_model", unload)
+
+    def set_unload_search_model(self, unload: bool) -> None:
+        self._set_unload("unload_search_model", unload)
+
+    def _set_unload(self, field: str, unload: bool) -> None:
+        with self._admin_lock:
+            self.catalog.set_meta(field, "1" if unload else "0")
+            self.settings = replace(self.settings, **{field: unload})
+            self.indexer.set_settings(self.settings)
 
     @property
     def search_model_loaded(self) -> bool:

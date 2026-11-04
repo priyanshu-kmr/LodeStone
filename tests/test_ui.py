@@ -13,10 +13,10 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QEvent, QObject, Qt  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
-from PySide6.QtWidgets import QApplication, QFileDialog, QLabel, QMessageBox, QWidget  # noqa: E402
+from PySide6.QtWidgets import QApplication, QFileDialog, QLabel, QMessageBox, QTabWidget, QWidget  # noqa: E402
 
 from conftest import FakeEmbedder, FakeOcr, textured  # noqa: E402
-from lodestone.config import MEDIA_SECONDS_STEP, TOKEN_LIMIT_STEP, Settings  # noqa: E402
+from lodestone.config import DEFAULT_MODEL, MEDIA_SECONDS_STEP, TOKEN_LIMIT_STEP, Settings  # noqa: E402
 from lodestone.engine import Engine  # noqa: E402
 from lodestone.ui.app import STYLE, SearchWindow, SettingsDialog  # noqa: E402
 
@@ -259,13 +259,45 @@ def test_settings_lists_and_changes_folders(qapp, engine, library, tmp_path, mon
     finish(window, qapp)
 
 
-def test_gpu_checkbox_starts_off_and_saves_the_choice(qapp, engine) -> None:
+def test_gpu_checkboxes_start_off_and_each_saves_its_own_choice(qapp, engine) -> None:
     window = SearchWindow(engine)
     dialog = SettingsDialog(engine, window)
-    assert dialog.use_gpu.isChecked() is False
-    dialog.use_gpu.setChecked(True)
-    assert wait_for(qapp, lambda: engine.use_gpu)
-    assert engine.embedder.gpu_settings == [True]
+    assert dialog.gpu_indexing.isChecked() is False
+    assert dialog.gpu_search.isChecked() is False
+    dialog.gpu_indexing.setChecked(True)
+    assert wait_for(qapp, lambda: engine.gpu_for_indexing)
+    assert engine.gpu_for_search is False
+    assert engine.embedder.gpu_settings == [("indexing", True)]
+    dialog.gpu_search.setChecked(True)
+    assert wait_for(qapp, lambda: engine.gpu_for_search)
+    assert engine.embedder.gpu_settings == [("indexing", True), ("search", True)]
+    dialog.close()
+    finish(window, qapp)
+
+
+def test_unloading_checkboxes_start_on_and_each_saves_its_own_choice(qapp, engine) -> None:
+    window = SearchWindow(engine)
+    dialog = SettingsDialog(engine, window)
+    assert dialog.unload_index.isChecked() and dialog.unload_search.isChecked()
+    assert "1 minute" in dialog.unload_index.text()
+    assert "10 minutes" in dialog.unload_search.text()
+    dialog.unload_search.setChecked(False)
+    assert wait_for(qapp, lambda: not engine.settings.unload_search_model)
+    assert engine.settings.unload_index_model is True
+    dialog.unload_index.setChecked(False)
+    assert wait_for(qapp, lambda: not engine.settings.unload_index_model)
+    dialog.close()
+    finish(window, qapp)
+
+
+def test_these_options_are_on_the_advanced_tab(qapp, engine) -> None:
+    window = SearchWindow(engine)
+    dialog = SettingsDialog(engine, window)
+    tabs = dialog.findChild(QTabWidget)
+    assert tabs.tabText(tabs.count() - 1) == "Advanced"
+    advanced = tabs.widget(tabs.count() - 1)
+    for box in (dialog.gpu_indexing, dialog.gpu_search, dialog.unload_index, dialog.unload_search):
+        assert advanced.isAncestorOf(box)
     dialog.close()
     finish(window, qapp)
 
@@ -426,6 +458,78 @@ def test_cancelling_a_media_duration_puts_the_slider_back(qapp, engine, index_ta
     assert dialog.audio_slider.value() * MEDIA_SECONDS_STEP == start
     assert engine.audio_seconds == start
     assert not dialog.audio_apply.isEnabled()
+
+
+def test_switching_model_tests_it_asks_then_reindexes(qapp, engine, index_tab, monkeypatch) -> None:
+    dialog = index_tab
+    seen = []
+
+    def accept(*args, **kwargs):
+        seen.append(args[2])
+        return QMessageBox.StandardButton.Yes
+
+    calls = engine.embedder.document_calls
+    assert not dialog.model_switch.isEnabled()  # Already on the model shown.
+    assert not dialog.model_default.isEnabled()
+    monkeypatch.setattr(QMessageBox, "question", accept)
+    dialog.model_input.setText(" someone/small-model ")
+    assert dialog.model_switch.isEnabled()
+    dialog.model_switch.click()
+    assert wait_for(qapp, lambda: "Reindexing with someone/small-model" in dialog.model_note.text())
+    assert "someone/small-model" in seen[0] and "embed all your files again" in seen[0]
+    assert engine.embedding_model.id == "someone/small-model"
+    assert "someone/small-model" in dialog.model_current.text()
+    assert dialog.model_input.isEnabled() and dialog.model_default.isEnabled()
+    drain(engine)
+    assert engine.embedder.document_calls == calls + 1
+
+    dialog.model_default.click()
+    assert wait_for(qapp, lambda: engine.embedding_model == DEFAULT_MODEL)
+    assert wait_for(qapp, lambda: dialog.model_input.text() == DEFAULT_MODEL.id)
+    assert not dialog.model_default.isEnabled()
+
+
+def test_reopening_settings_while_a_model_is_tested_keeps_it_busy(qapp, engine, index_tab, monkeypatch) -> None:
+    dialog = index_tab
+    release = threading.Event()
+    real = engine.embedder.inspect_model
+    monkeypatch.setattr(engine.embedder, "inspect_model", lambda model_id: release.wait(10) and real(model_id))
+    monkeypatch.setattr(QMessageBox, "question", _cancel)
+    dialog.model_input.setText("someone/slow-model")
+    dialog.model_switch.click()
+    dialog.refresh()
+    assert not dialog.model_input.isEnabled() and not dialog.model_switch.isEnabled()
+    assert dialog.model_input.text() == "someone/slow-model"
+    release.set()
+    assert wait_for(qapp, lambda: dialog.model_input.isEnabled())
+
+
+def test_cancelling_a_model_switch_changes_nothing(qapp, engine, index_tab, monkeypatch) -> None:
+    dialog = index_tab
+    calls = engine.embedder.document_calls
+    before = engine.embedding_model
+    monkeypatch.setattr(QMessageBox, "question", _cancel)
+    dialog.model_input.setText("someone/small-model")
+    dialog.model_switch.click()
+    assert wait_for(qapp, lambda: dialog.model_input.isEnabled())
+    assert engine.embedding_model == before
+    assert dialog.model_input.text() == before.id
+    drain(engine)
+    assert engine.embedder.document_calls == calls
+
+
+def test_a_model_that_fails_its_test_changes_nothing(qapp, engine, index_tab, monkeypatch) -> None:
+    dialog = index_tab
+    before = engine.embedding_model
+    shown = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: shown.append(a[2]))
+    engine.embedder.inspected = ValueError("Couldn't load someone/broken")
+    dialog.model_input.setText("someone/broken")
+    dialog.model_switch.click()
+    assert wait_for(qapp, lambda: shown)
+    assert "someone/broken" in shown[0]
+    assert engine.embedding_model == before
+    assert dialog.model_input.isEnabled()
 
 
 def test_reindex_button_asks_first(qapp, engine, index_tab, monkeypatch) -> None:

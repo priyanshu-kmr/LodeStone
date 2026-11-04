@@ -8,13 +8,15 @@ import threading
 import time
 from pathlib import Path
 
+import numpy as np
 import pytest
 from PIL import Image, ImageFilter
 
-from conftest import FakeEmbedder, FakeOcr, textured
+from conftest import FakeEmbedder, FakeOcr, textured, write_video, write_wav
+from lodestone.config import EmbeddingModel
 from lodestone.engine import Engine
 from lodestone.search import IMAGES
-from lodestone.vectors import IMAGE, TEXT
+from lodestone.vectors import AUDIO, IMAGE, TEXT, VIDEO, VectorStore
 
 
 @pytest.fixture
@@ -41,6 +43,74 @@ def drain(engine: Engine) -> None:
 
 def names(results) -> list[str]:
     return [r.name for r in results]
+
+
+TEXT_ONLY = EmbeddingModel(id="someone/text-only", kinds=("text",), query_prompt=None, document_prompt=None)
+
+
+class TestSwitchingModel:
+    def test_every_file_is_embedded_again_with_the_new_model(self, engine, library) -> None:
+        (library / "notes.txt").write_text("We discussed system design and ownership.")
+        textured((640, 480), (220, 20, 20)).save(library / "red.png")
+        sync(engine)
+        documents, images = engine.embedder.document_calls, engine.embedder.image_calls
+
+        engine.set_embedding_model(EmbeddingModel(id="someone/other"))
+        assert engine.vectors.count(TEXT) == 0 and engine.vectors.count(IMAGE) == 0
+        # The old vectors are gone, but exact words and filenames still work during the reindex.
+        assert names(engine.search("system design")) == ["notes.txt"]
+
+        sync(engine)
+        assert engine.embedder.document_calls == documents + 1
+        assert engine.embedder.image_calls == images + 1
+        assert engine.vectors.count(TEXT) == 1 and engine.vectors.count(IMAGE) == 1
+
+    def test_the_choice_survives_a_restart(self, paths, engine, library, fast_settings) -> None:
+        engine.set_embedding_model(TEXT_ONLY)
+        engine.stop()
+        reopened = Engine(paths, FakeEmbedder(), FakeOcr(), fast_settings, watch=False)
+        try:
+            assert reopened.embedding_model == TEXT_ONLY
+        finally:
+            reopened.stop()
+
+    def test_what_the_model_cannot_read_is_still_found_by_filename(self, engine, library) -> None:
+        textured((640, 480), (220, 20, 20)).save(library / "holiday.png")
+        write_wav(library / "meeting.wav", 2)
+        write_video(library / "trip.mp4", 2, lambda _: (20, 200, 20))
+        engine.set_embedding_model(TEXT_ONLY)
+        sync(engine)
+        assert engine.embedder.image_calls == 0
+        assert engine.embedder.audio_lengths == [] and engine.embedder.video_lengths == []
+        assert engine.vectors.count(IMAGE) == engine.vectors.count(AUDIO) == engine.vectors.count(VIDEO) == 0
+        assert engine.status().queued == 0
+        assert names(engine.search("holiday")) == ["holiday.png"]
+        assert names(engine.search("meeting")) == ["meeting.wav"]
+        assert names(engine.search("trip")) == ["trip.mp4"]
+
+    def test_text_in_an_image_is_still_read_without_an_image_model(self, paths, library, fast_settings) -> None:
+        eng = Engine(paths, FakeEmbedder(), FakeOcr("invoice number 48213"), fast_settings, watch=False)
+        try:
+            eng.catalog.add_folder(str(library))
+            textured((640, 480), (220, 20, 20)).save(library / "scan.png")
+            eng.set_embedding_model(TEXT_ONLY)
+            sync(eng)
+            assert eng.vectors.count(TEXT) == 1 and eng.vectors.count(IMAGE) == 0
+            assert names(eng.search("48213")) == ["scan.png"]
+        finally:
+            eng.stop()
+
+    def test_a_model_with_another_size_of_vector_gets_tables_that_fit(self, paths) -> None:
+        store = VectorStore(paths.vectors, "someone/big", 768)
+        store.add(TEXT, [1], [1], np.ones((1, 768), dtype=np.float32))
+        store.switch_model("someone/small", 4)
+        assert store.count(TEXT) == 0
+        vector = np.array([[1, 0, 0, 0]], dtype=np.float32)
+        store.add(TEXT, [2], [2], vector)
+        assert [hit.file_id for hit in store.search(TEXT, vector[0], 5)] == [2]
+        # Switching back starts empty too, because the old tables would have gone stale.
+        store.switch_model("someone/big", 768)
+        assert store.count(TEXT) == 0
 
 
 class TestIndexing:
@@ -277,12 +347,19 @@ class TestLargeFiles:
 class TestGpuSetting:
     def test_off_by_default_and_remembered(self, paths, fast_settings) -> None:
         first = Engine(paths, FakeEmbedder(), FakeOcr(), fast_settings, watch=False)
-        assert first.use_gpu is False
-        first.set_use_gpu(True)
-        assert first.embedder.gpu_settings == [True]
+        assert first.gpu_for_indexing is False and first.gpu_for_search is False
+        first.set_gpu_for_indexing(True)
+        assert first.embedder.gpu_settings == [("indexing", True)]
         first.catalog.close()
         second = Engine(paths, FakeEmbedder(), FakeOcr(), fast_settings, watch=False)
-        assert second.use_gpu is True
+        assert second.gpu_for_indexing is True and second.gpu_for_search is False
+
+    def test_the_old_single_setting_carries_over_until_each_is_chosen(self, paths, fast_settings) -> None:
+        engine = Engine(paths, FakeEmbedder(), FakeOcr(), fast_settings, watch=False)
+        engine.catalog.set_meta("use_gpu", "1")
+        assert engine.gpu_for_indexing is True and engine.gpu_for_search is True
+        engine.set_gpu_for_search(False)
+        assert engine.gpu_for_indexing is True and engine.gpu_for_search is False
 
 
 class TestIdle:
@@ -301,6 +378,75 @@ class TestIdle:
         assert engine.embedder.released == 1
         assert engine.indexer._ocr.released is True
         engine.stop()
+
+    def _idle_engine(self, paths, library) -> Engine:
+        from lodestone.config import Settings
+
+        settings = Settings(debounce_seconds=0, delete_delay_seconds=0, vision_idle_unload_seconds=0.0)
+        engine = Engine(paths, FakeEmbedder(), FakeOcr(), settings, watch=False)
+        engine.catalog.add_folder(str(library))
+        (library / "a.txt").write_text("some text worth embedding")
+        sync(engine)
+        return engine
+
+    def test_each_model_can_stay_loaded_on_its_own(self, paths, library) -> None:
+        engine = self._idle_engine(paths, library)
+        embedder = engine.embedder
+
+        engine.set_unload_index_model(False)
+        time.sleep(0.01)
+        engine.indexer.idle()
+        assert embedder.released == 0
+        assert embedder.search_releases == 1
+        assert engine.indexer._ocr.released is True  # OCR isn't covered by the option.
+
+        engine.set_unload_search_model(False)
+        engine.indexer.idle()
+        assert embedder.search_releases == 1
+
+        engine.set_unload_index_model(True)
+        time.sleep(0.01)
+        engine.indexer.idle()
+        assert embedder.released == 1
+        assert embedder.search_releases == 1
+        engine.stop()
+
+    def test_the_unloading_choices_are_remembered(self, paths, library) -> None:
+        engine = self._idle_engine(paths, library)
+        engine.set_unload_search_model(False)
+        engine.stop()
+        reopened = Engine(paths, FakeEmbedder(), FakeOcr(), watch=False)
+        assert reopened.settings.unload_search_model is False
+        assert reopened.settings.unload_index_model is True
+        reopened.stop()
+
+    def test_models_still_unload_while_paused(self, paths, library) -> None:
+        engine = self._idle_engine(paths, library)
+        engine.set_paused(True)
+        engine.start()
+        try:
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and not engine.embedder.released:
+                time.sleep(0.05)
+            assert engine.embedder.released == 1
+            assert engine.embedder.search_releases >= 1
+        finally:
+            engine.stop()
+
+    def test_pausing_does_not_tidy_the_index(self, paths, library, monkeypatch) -> None:
+        engine = self._idle_engine(paths, library)
+        calls = []
+        monkeypatch.setattr(engine.indexer, "maintain", lambda: calls.append(True))
+        engine.set_paused(True)
+        engine.start()
+        try:
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and not engine.embedder.released:
+                time.sleep(0.05)
+            assert engine.embedder.released == 1
+            assert calls == []
+        finally:
+            engine.stop()
 
 
 class TestBusyFiles:

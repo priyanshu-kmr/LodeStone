@@ -3,13 +3,37 @@
 from __future__ import annotations
 
 import ctypes
+import json
 import os
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 MODEL_ID = "google/embeddinggemma-2"
 EMBEDDING_DIM = 768
+
+
+@dataclass(frozen=True)
+class EmbeddingModel:
+    """What the app needs to know about a model. Saved in the catalog once a model has been chosen."""
+
+    id: str = MODEL_ID
+    dim: int = EMBEDDING_DIM
+    # What it can embed. Anything else is still found by filename, and by any text read from it.
+    kinds: tuple[str, ...] = ("text", "image", "audio", "video")
+    query_prompt: str | None = "SearchQuery"
+    document_prompt: str | None = "Document"
+
+    def to_json(self) -> str:
+        return json.dumps(asdict(self))
+
+    @classmethod
+    def from_json(cls, text: str) -> "EmbeddingModel":
+        values = json.loads(text)
+        return cls(**{**values, "kinds": tuple(values["kinds"])})
+
+
+DEFAULT_MODEL = EmbeddingModel()
 
 DOCUMENT_EXTS = {
     ".pdf", ".docx", ".pptx", ".xlsx", ".txt", ".md", ".csv", ".log", ".html", ".htm",
@@ -125,6 +149,9 @@ class Settings:
     max_vram_fraction: float = 0.65
     held_image_long_side: int = 1280
     vision_idle_unload_seconds: float = 60.0
+    # Turned off in Settings to skip the reload wait, at the cost of keeping the memory in use.
+    unload_index_model: bool = True
+    unload_search_model: bool = True
     # The next search after this takes a few seconds, because the model has to load again.
     search_idle_unload_seconds: float = 600.0
     cpu_threads: int = 4

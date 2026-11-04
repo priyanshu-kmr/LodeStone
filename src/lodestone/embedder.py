@@ -1,9 +1,11 @@
-"""EmbeddingGemma 2, loaded as two instances so search stays light and is never blocked.
+"""The embedding model, loaded as two instances so search stays light and is never blocked.
 
-Search only needs the text encoder. Indexing loads text and vision while it has work, and adds the
-audio encoder only once it meets a file with sound. All of them produce vectors in the same space,
-and all unload when idle. Everything runs on the CPU unless the user turns on the GPU, because
-search is about as fast either way and the GPU option costs VRAM.
+With EmbeddingGemma 2, the default, search only needs the text encoder. Indexing loads text and
+vision while it has work, and adds the audio encoder only once it meets a file with sound. All of
+them produce vectors in the same space, and all unload when idle. Everything runs on the CPU unless
+the user turns on the GPU, because search is about as fast either way and the GPU option costs VRAM.
+
+Other models can be chosen in Settings. They load whole, and inspect_model finds out what they can do.
 """
 
 from __future__ import annotations
@@ -20,11 +22,14 @@ from typing import Generator
 import numpy as np
 from PIL import Image
 
-from .config import MODEL_ID, SETTINGS, Settings
+from .config import DEFAULT_MODEL, MODEL_ID, SETTINGS, EmbeddingModel, Settings
 from .media import SAMPLE_RATE
 
 log = logging.getLogger(__name__)
 _MODEL_MAX_TOKENS = 8192  # What one embedding can hold, across everything in it.
+# The names models commonly give their prompts, best first.
+_QUERY_PROMPTS = ("SearchQuery", "query", "search_query")
+_DOCUMENT_PROMPTS = ("Document", "document", "passage", "search_document")
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 
 
@@ -33,6 +38,15 @@ def _unit(vectors: np.ndarray) -> np.ndarray:
     values = np.asarray(vectors, dtype=np.float32)
     norm = np.linalg.norm(values, axis=-1, keepdims=True)
     return values / np.maximum(norm, 1e-9)
+
+
+def _gives_vector(encode, dim: int) -> bool:
+    try:
+        vectors = encode()
+    except Exception as error:
+        log.info("this model can't be used for that content: %s", error)
+        return False
+    return vectors.shape == (1, dim) and bool(np.isfinite(vectors).all())
 
 
 def _return_unused_ram() -> None:
@@ -94,9 +108,17 @@ class _LoadGate:
 
 
 class GemmaEmbedder:
-    def __init__(self, settings: Settings = SETTINGS, use_gpu: bool = False) -> None:
+    def __init__(
+        self,
+        settings: Settings = SETTINGS,
+        gpu_for_search: bool = False,
+        gpu_for_indexing: bool = False,
+        model: EmbeddingModel = DEFAULT_MODEL,
+    ) -> None:
         self._settings = settings
-        self._use_gpu = use_gpu
+        self._gpu_for_search = gpu_for_search
+        self._gpu_for_indexing = gpu_for_indexing
+        self._model = model
         self._query_model = None
         self._index_model = None
         self._index_has_audio = False
@@ -105,17 +127,20 @@ class GemmaEmbedder:
         self._index_lock = threading.Lock()
         self._gate = _LoadGate()
 
-    def _load(self, with_vision: bool, with_audio: bool = False):
+    def _load(self, with_vision: bool, with_audio: bool = False, use_gpu: bool = False):
         # Imported here so the UI opens instantly, before these heavy libraries load.
         import torch
         from sentence_transformers import SentenceTransformer
 
+        model_id = self._model.id
+        # These savings were measured on Gemma, and other models may not have these parts to leave out.
+        is_gemma = model_id == MODEL_ID
         config = {}
-        if not with_audio:
+        if is_gemma and not with_audio:
             config["audio_config"] = None
-        if not with_vision:
+        if is_gemma and not with_vision:
             config["vision_config"] = None
-        cuda = self._use_gpu and torch.cuda.is_available()
+        cuda = use_gpu and torch.cuda.is_available()
         # Google warns that float16 can silently degrade embeddings, so never use it.
         if cuda:
             torch.cuda.set_per_process_memory_fraction(self._settings.max_vram_fraction)
@@ -124,7 +149,7 @@ class GemmaEmbedder:
             # Half the cores cost little speed and leave the laptop usable. Without bfloat16
             # hardware, it was 5x slower for indexing, so only search uses it, to save RAM.
             torch.set_num_threads(self._settings.cpu_threads)
-            dtype = torch.float32 if with_vision else torch.bfloat16
+            dtype = torch.bfloat16 if is_gemma and not with_vision else torch.float32
         arguments = dict(
             device="cuda" if cuda else "cpu", config_kwargs=config, model_kwargs={"dtype": dtype}
         )
@@ -133,11 +158,12 @@ class GemmaEmbedder:
         with self._gate.loading():
             try:
                 # After the first download this is a local tool, so don't contact the network.
-                model = SentenceTransformer(MODEL_ID, local_files_only=True, **arguments)
+                model = SentenceTransformer(model_id, local_files_only=True, **arguments)
             except OSError:
-                log.info("downloading %s", MODEL_ID)
-                model = SentenceTransformer(MODEL_ID, **arguments)
-        model.max_seq_length = self._settings.max_text_tokens
+                log.info("downloading %s", model_id)
+                model = SentenceTransformer(model_id, **arguments)
+        # A model's own limit can be lower than ours, and going past it is an error.
+        model.max_seq_length = min(model.max_seq_length or self._settings.max_text_tokens, self._settings.max_text_tokens)
         return model
 
     # ---- settings and lifecycle ---------------------------------------------------------------
@@ -146,16 +172,81 @@ class GemmaEmbedder:
     def search_model_loaded(self) -> bool:
         return self._query_model is not None
 
-    def set_use_gpu(self, use_gpu: bool) -> None:
-        """Drop the loaded models, so each one reloads on the right device when next needed."""
-        with self._query_lock, self._index_lock:
-            if use_gpu == self._use_gpu:
+    def set_gpu_for_search(self, use_gpu: bool) -> None:
+        """Drop the loaded model, so it reloads on the right device when next needed."""
+        with self._query_lock:
+            if use_gpu == self._gpu_for_search:
                 return
-            self._use_gpu = use_gpu
+            self._gpu_for_search = use_gpu
+            self._query_model = None
+        _free_memory()
+
+    def set_gpu_for_indexing(self, use_gpu: bool) -> None:
+        """Drop the loaded model, so it reloads on the right device when next needed."""
+        with self._index_lock:
+            if use_gpu == self._gpu_for_indexing:
+                return
+            self._gpu_for_indexing = use_gpu
+            self._index_model = None
+            self._index_has_audio = False
+        _free_memory()
+
+    def supports(self, kind: str) -> bool:
+        return kind in self._model.kinds
+
+    def set_model(self, model: EmbeddingModel) -> None:
+        """Drop the loaded models, so the new one loads when next needed."""
+        with self._query_lock, self._index_lock:
+            self._model = model
             self._query_model = None
             self._index_model = None
             self._index_has_audio = False
         _free_memory()
+
+    def inspect_model(self, model_id: str) -> EmbeddingModel:
+        """Download a model if needed, then try each kind of content through the real code paths.
+
+        A model can list a kind that it only accepts in some other form, so listing isn't enough.
+        Never runs code from the model's repository, so models that need that fail here.
+        """
+        probe = GemmaEmbedder(self._settings, model=EmbeddingModel(id=model_id))
+        probe._gate = self._gate  # Loading affects the whole process, so it has to wait its turn.
+        try:
+            loaded = probe._indexing_model()
+        except Exception as error:
+            raise ValueError(f"Couldn't load {model_id}: {error}") from error
+        try:
+            if "text" not in loaded.modalities:
+                raise ValueError(f"{model_id} can't read text, which search needs.")
+            prompts = loaded.prompts or {}
+            probe._model = EmbeddingModel(
+                id=model_id,
+                query_prompt=next((p for p in _QUERY_PROMPTS if p in prompts), None),
+                document_prompt=next((p for p in _DOCUMENT_PROMPTS if p in prompts), None),
+            )
+            try:
+                vectors = probe.encode_documents(["A short sentence to test the model."])
+            except Exception as error:
+                raise ValueError(f"{model_id} couldn't embed text: {error}") from error
+            dim = int(vectors.shape[-1])
+            picture = Image.new("RGB", (256, 256), (128, 128, 128))
+            sound = np.random.default_rng(0).normal(0, 0.1, SAMPLE_RATE).astype(np.float32)
+            tries = {
+                "image": lambda: probe.encode_images([picture]),
+                "audio": lambda: probe.encode_audio(sound),
+                "video": lambda: probe.encode_video([picture] * 2),
+            }
+            kinds = ["text"]
+            for kind, encode in tries.items():
+                if kind in loaded.modalities and _gives_vector(encode, dim):
+                    kinds.append(kind)
+            return EmbeddingModel(
+                model_id, dim, tuple(kinds), probe._model.query_prompt, probe._model.document_prompt
+            )
+        finally:
+            del loaded
+            probe._index_model = None
+            _free_memory()
 
     def warm_up(self) -> None:
         """Load the search model ahead of time, so the next search does not pay for it."""
@@ -195,22 +286,26 @@ class GemmaEmbedder:
     def encode_query(self, text: str) -> np.ndarray:
         with self._query_lock:
             if self._query_model is None:
-                self._query_model = self._load(with_vision=False)
-            self._last_query = time.monotonic()
+                self._query_model = self._load(with_vision=False, use_gpu=self._gpu_for_search)
             with self._gate.working():
-                return _unit(
-                    self._query_model.encode(text, prompt_name="SearchQuery", show_progress_bar=False)
+                vector = _unit(
+                    self._query_model.encode(
+                        text, prompt_name=self._model.query_prompt, show_progress_bar=False
+                    )
                 )
+            # Idle time starts when the search finishes. It can't unload during one, as this holds the lock.
+            self._last_query = time.monotonic()
+            return vector
 
     def _indexing_model(self, with_audio: bool = False):
         if with_audio and not self._index_has_audio:
             # The audio encoder is the largest part, so most runs shouldn't pay for it.
             self._index_model = None
             _free_memory()
-            self._index_model = self._load(with_vision=True, with_audio=True)
+            self._index_model = self._load(True, True, self._gpu_for_indexing)
             self._index_has_audio = True
         elif self._index_model is None:
-            self._index_model = self._load(with_vision=True)
+            self._index_model = self._load(True, False, self._gpu_for_indexing)
         return self._index_model
 
     def encode_documents(self, texts: list[str]) -> np.ndarray:
@@ -223,7 +318,10 @@ class GemmaEmbedder:
                 try:
                     with self._gate.working():
                         vectors = model.encode(
-                            texts, prompt_name="Document", batch_size=batch_size, show_progress_bar=False
+                            texts,
+                            prompt_name=self._model.document_prompt,
+                            batch_size=batch_size,
+                            show_progress_bar=False,
                         )
                     break
                 except torch.cuda.OutOfMemoryError:

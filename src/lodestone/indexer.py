@@ -35,6 +35,7 @@ class IndexEmbedder(Protocol):
     def encode_audio(self, samples: np.ndarray) -> np.ndarray: ...
     def release_index_model(self) -> None: ...
     def release_search_model_if_idle(self) -> None: ...
+    def supports(self, kind: str) -> bool: ...
 
 
 def hash_file(path: str) -> str:
@@ -113,12 +114,17 @@ class Indexer:
     def idle(self) -> None:
         """Called when nothing is ready: tidy the index, then free whatever has gone unused."""
         self.maintain()
-        self._embedder.release_search_model_if_idle()
+        self.free_unused()
+
+    def free_unused(self) -> None:
+        """Also runs while paused, when tidying the index would be unwanted work."""
+        if self._settings.unload_search_model:
+            self._embedder.release_search_model_if_idle()
         if time.monotonic() - self._last_work <= self._settings.vision_idle_unload_seconds:
             return
         close_shared_worker()
         self._ocr.release()
-        if self._model_loaded:
+        if self._model_loaded and self._settings.unload_index_model:
             self._embedder.release_index_model()
             self._model_loaded = False
 
@@ -332,7 +338,7 @@ class Indexer:
 
     def _embed_pictures(self, path: str, file_id: int) -> bool:
         settings = self._settings
-        if settings.video_seconds == 0:
+        if settings.video_seconds == 0 or not self._embedder.supports(VIDEO):
             return False
         frames = read_frames(
             path,
@@ -349,7 +355,7 @@ class Indexer:
 
     def _embed_sound(self, path: str, file_id: int) -> bool:
         settings = self._settings
-        if settings.audio_seconds == 0:
+        if settings.audio_seconds == 0 or not self._embedder.supports(AUDIO):
             return False
         samples = read_audio(path, settings.audio_seconds)
         if (
@@ -379,6 +385,12 @@ class Indexer:
         chunks = chunk_text(ocr.text, self._settings)
         if chunks:
             self._embed_chunks(file_id, self._catalog.add_chunks(file_id, chunks, "ocr"), chunks)
+        if not self._embedder.supports(IMAGE):
+            # The model can't see pictures, so its filename and any text in it are all there is.
+            self._catalog.finish_file(file_id, "full", sharpness=result.sharpness, ocr_score=ocr.score)
+            self._catalog.dequeue(path)
+            self._retries.pop(path, None)
+            return None
         return _ImageJob(path, file_id, result.image, result.sharpness, ocr.score)
 
     def _flush_images(self, jobs: list[_ImageJob]) -> None:
